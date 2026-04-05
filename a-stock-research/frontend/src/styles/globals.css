@@ -1,0 +1,171 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================
+   CSS变量 - 暗色金融主题
+   ============================================ */
+:root {
+  --color-bg-primary: #0f1419;
+  --color-bg-secondary: #1a1f2e;
+  --color-bg-elevated: #242b3d;
+  --color-bg-hover: #2a3348;
+  --color-border: #2e3a50;
+  --color-text-primary: #e8ecf1;
+  --color-text-secondary: #8899aa;
+  --color-text-muted: #5c6b7f;
+  --color-brand: #3b82f6;
+  --color-brand-hover: #2563eb;
+  --color-rise: #ef4444;
+  --color-fall: #22c55e;
+  --color-warning: #f59e0b;
+  --color-success: #10b981;
+  --color-danger: #ef4444;
+  --sidebar-width: 240px;
+  --header-height: 56px;
+}
+
+/* 亮色主题覆盖 */
+:root.light {
+  --color-bg-primary: #f3f4f6;
+  --color-bg-secondary: #ffffff;
+  --color-bg-elevated: #f9fafb;
+  --color-bg-hover: #e5e7eb;
+  --color-border: #e5e7eb;
+  --color-text-primary: #1f2937;
+  --color-text-secondary: #4b5563;
+  --color-text-muted: #9ca3af;
+  --color-rise: #dc2626;
+  --color-fall: #16a34a;
+}
+
+/* ============================================
+   全局样式
+   ============================================ */
+body {
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4a60;
+}
+
+/* Ant Design 暗色主题覆盖 */
+.ant-card {
+  background: var(--color-bg-secondary) !important;
+  border-color: var(--color-border) !important;
+}
+
+.ant-table {
+  background: transparent !important;
+}
+
+.ant-table-thead > tr > th {
+  background: var(--color-bg-elevated) !important;
+  border-color: var(--color-border) !important;
+  color: var(--color-text-secondary) !important;
+}
+
+.ant-table-tbody > tr > td {
+  border-color: var(--color-border) !important;
+  color: var(--color-text-primary) !important;
+}
+
+.ant-table-tbody > tr:hover > td {
+  background: var(--color-bg-hover) !important;
+}
+
+.ant-input,
+.ant-select-selector,
+.ant-input-number {
+  background: var(--color-bg-elevated) !important;
+  border-color: var(--color-border) !important;
+  color: var(--color-text-primary) !important;
+}
+
+.ant-btn-primary {
+  background: var(--color-brand) !important;
+  border-color: var(--color-brand) !important;
+}
+
+.ant-btn-primary:hover {
+  background: var(--color-brand-hover) !important;
+  border-color: var(--color-brand-hover) !important;
+}
+
+.ant-modal-content {
+  background: var(--color-bg-secondary) !important;
+}
+
+.ant-drawer-content {
+  background: var(--color-bg-secondary) !important;
+}
+
+.ant-tag {
+  border-color: transparent !important;
+}
+
+/* Markdown内容样式 */
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3 {
+  color: var(--color-text-primary);
+  border-color: var(--color-border);
+  margin-top: 1.5em;
+  margin-bottom: 0.75em;
+}
+
+.markdown-content p {
+  color: var(--color-text-secondary);
+  line-height: 1.8;
+}
+
+.markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--color-border);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.markdown-content th {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+}
+
+.markdown-content td {
+  color: var(--color-text-primary);
+}
+
+/* 进度条动画 */
+@keyframes progress-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.progress-pulse {
+  animation: progress-pulse 1.5s ease-in-out infinite;
+}

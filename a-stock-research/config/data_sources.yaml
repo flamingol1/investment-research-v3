@@ -1,0 +1,66 @@
+# 数据源配置
+
+akshare:
+  enabled: true
+  priority: 1
+  description: "AKShare - 开源A股数据接口"
+  endpoints:
+    stock_basic_info: "stock_individual_info_em"
+    stock_history: "stock_zh_a_hist"
+    stock_realtime: "stock_zh_a_spot_em"
+    financial_income: "stock_financial_report_ths"
+    financial_balance: "stock_financial_report_ths"
+    financial_cashflow: "stock_financial_report_ths"
+    industry_sw: "sw_index_first_cons"
+    industry_pe: "stock_industry_pe_ratio"
+  rate_limit:
+    requests_per_second: 3
+    burst_limit: 5
+
+baostock:
+  enabled: true
+  priority: 2
+  description: "BaoStock - 免注册A股历史数据"
+  endpoints:
+    stock_history: "query_history_k_data_plus"
+    stock_basic: "query_stock_basic"
+    financial_profit: "query_profit_data"
+    financial_balance: "query_balance_data"
+    financial_cashflow: "query_cash_data"
+    financial_growth: "query_growth_data"
+    dividend: "query_dividend_data"
+  valuation_fields: ["peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
+
+tushare:
+  enabled: false
+  priority: 3
+  description: "Tushare Pro - 专业金融数据"
+  token_env: "TUSHARE_TOKEN"
+  endpoints:
+    stock_basic: "stock_basic"
+    daily: "daily"
+    balancesheet: "balancesheet"
+    income: "income"
+    cashflow: "cashflow"
+  rate_limit:
+    requests_per_minute: 200
+
+data_type_mapping:
+  stock_basic_info:
+    primary: "akshare"
+    fallback: "baostock"
+  stock_price_daily:
+    primary: "akshare"
+    fallback: "baostock"
+  stock_price_realtime:
+    primary: "akshare"
+    fallback: null
+  financial_statements:
+    primary: "akshare"
+    fallback: "baostock"
+  industry_classification:
+    primary: "akshare"
+    fallback: null
+  valuation_metrics:
+    primary: "baostock"
+    fallback: "akshare"

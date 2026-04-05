@@ -1,0 +1,68 @@
+# Agent配置 - 各Agent的超时、模型覆盖、参数
+
+data_layer:
+  collector:
+    timeout_minutes: 10
+    model: null
+    batch_size: 50
+  cleaner:
+    timeout_minutes: 5
+    model: null
+
+analysis_layer:
+  screener:
+    timeout_minutes: 10
+    model: "qwen3-plus"
+    max_stocks: 100
+  industry:
+    timeout_minutes: 15
+    model: "qwen3-plus"
+  business:
+    timeout_minutes: 15
+    model: "qwen3-plus"
+    require_counter_argument: true
+  governance:
+    timeout_minutes: 10
+    model: "qwen3-plus"
+  financial:
+    timeout_minutes: 20
+    model: "qwen3-max"
+    lookback_years: 5
+  valuation:
+    timeout_minutes: 15
+    model: "qwen3-max"
+    methods: ["PE", "PB", "DCF", "PEG", "PS"]
+  risk:
+    timeout_minutes: 15
+    model: "qwen3-plus"
+    scenarios: ["optimistic", "base", "pessimistic"]
+
+decision_layer:
+  orchestrator:
+    timeout_minutes: 60
+    model: "doubao-pro"
+    max_retries: 2
+  conclusion:
+    timeout_minutes: 10
+    model: "qwen3-plus"
+
+validation:
+  require_data_source: true
+  require_counter_argument: true
+  require_failure_condition: true
+  primary_source_ratio: 0.8
+  no_vague_expressions: true
+
+# ============================================================
+# Phase 7: 知识库Agent配置
+# ============================================================
+knowledge_base:
+  updater:
+    timeout_minutes: 5
+    model: null  # 不依赖LLM
+  tracker:
+    timeout_minutes: 10
+    model: null  # 纯规则检查
+  store:
+    auto_save: true
+    batch_size: 100

@@ -1,0 +1,158 @@
+# A股投研多Agent系统 - 主配置
+
+system:
+  name: "A股投研多Agent系统"
+  version: "0.1.0"
+  debug: false
+  log_level: "INFO"
+
+# ============================================================
+# LLM 提供商配置
+# ============================================================
+llm:
+  providers:
+    # 百炼 (Alibaba Bailian) - Anthropic 兼容协议
+    # 支持: 千问/智谱/Kimi/MiniMax 多品牌模型
+    bailian:
+      api_key_env: "BAILIAN_API_KEY"
+      base_url_env: "BAILIAN_BASE_URL"
+      default_base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+      protocol: "anthropic"
+      models:
+        # 千问系列
+        qwen3-coder: "qwen3-coder-next"
+        qwen3-coder-plus: "qwen3-coder-plus"
+        qwen3-plus: "qwen3.5-plus"
+        qwen3-max: "qwen3-max-2026-01-23"
+        # 智谱
+        glm-5: "glm-5"
+        glm-4.7: "glm-4.7"
+        # Kimi
+        kimi-k2.5: "kimi-k2.5"
+        # MiniMax
+        minimax-m2.5: "MiniMax-M2.5"
+
+    # 火山引擎 (Volcengine) - OpenAI 兼容协议
+    # 支持: 豆包/DeepSeek/Kimi/智谱/MiniMax
+    volcengine:
+      api_key_env: "VOLCENGINE_API_KEY"
+      base_url_env: "VOLCENGINE_BASE_URL"
+      default_base_url: "https://ark.cn-beijing.volces.com/api/coding"
+      protocol: "openai"
+      models:
+        # 豆包系列 (字节)
+        doubao-code: "doubao-seed-2.0-code"
+        doubao-pro: "doubao-seed-2.0-pro"
+        doubao-lite: "doubao-seed-2.0-lite"
+        doubao-seed-code: "doubao-seed-code"
+        # DeepSeek (火山托管)
+        deepseek-v3.2: "deepseek-v3.2"
+        # 智谱 (火山托管)
+        glm-4.7-volc: "glm-4.7"
+        # Kimi (火山托管)
+        kimi-k2.5-volc: "kimi-k2.5"
+        # MiniMax (火山托管)
+        minimax-m2.5-volc: "minimax-m2.5"
+
+  # ============================================================
+  # 各层默认模型配置
+  # ============================================================
+  # 策略:
+  #   数据层 → 百炼 qwen3-coder (结构化提取，成本低)
+  #   分析层 → 百炼 qwen3-plus (推理能力强, 支持深度思考)
+  #   决策层 → 火山 doubao-pro (综合能力强)
+  #   复杂推理 → 百炼 qwen3-max / 火山 deepseek-v3.2
+  # ============================================================
+  layer_models:
+    data_layer:
+      default: "qwen3-coder"
+      fallback: "doubao-code"
+    analysis_layer:
+      default: "qwen3-plus"       # 分析层主力 (支持深度思考)
+      financial: "qwen3-max"      # 财务分析用最强模型
+      valuation: "qwen3-max"      # 估值分析用最强模型
+      risk: "qwen3-plus"          # 风险分析
+      fallback: "doubao-pro"
+    decision_layer:
+      default: "doubao-pro"       # 决策层用豆包pro
+      conclusion: "qwen3-plus"    # 结论生成
+      fallback: "qwen3-coder"
+    reporting: "qwen3-coder"      # 报告生成
+
+  # LLM调用参数
+  defaults:
+    temperature: 0.1
+    max_tokens: 8192
+    timeout: 180
+    enable_thinking: true
+    thinking_budget_tokens: 4096
+
+# ============================================================
+# 存储配置
+# ============================================================
+storage:
+  sqlite:
+    path_env: "SQLITE_DB_PATH"
+    default_path: "./data/investresearch.db"
+  chroma:
+    persist_dir_env: "CHROMA_PERSIST_DIR"
+    default_dir: "./data/chroma"
+    collections:
+      stock: "stock_research"
+      industry: "industry_analysis"
+      macro: "macro_environment"
+      report: "research_report"
+      risk: "risk_analysis"
+      decision: "investment_decision"
+    embedding:
+      model: "all-MiniLM-L6-v2"
+    defaults:
+      n_results: 5
+      similarity_threshold: 0.7
+
+# ============================================================
+# Phase 7: 知识库与增量更新
+# ============================================================
+knowledge_base:
+  auto_save: true
+  default_update_frequency: "weekly"
+  watch_list_path: "./data/watch_list.json"
+  alert_thresholds:
+    pe_ttm_change_pct: 20
+    revenue_yoy_min: -10
+    net_profit_yoy_min: -15
+    price_change_pct_week: 10
+    debt_ratio_max: 70
+
+# ============================================================
+# 数据源配置
+# ============================================================
+# ============================================================
+# Web API 配置
+# ============================================================
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  cors_origins:
+    - "http://localhost:5173"
+    - "http://localhost:3000"
+    - "http://127.0.0.1:5173"
+    - "http://127.0.0.1:3000"
+
+# ============================================================
+# 数据源配置
+# ============================================================
+data_sources:
+  priority_order:
+    - "巨潮资讯网"
+    - "沪深北交易所"
+    - "东方财富"
+    - "同花顺"
+  rate_limit:
+    requests_per_second: 3
+    retry_attempts: 3
+    retry_backoff: 2.0
+  cache:
+    enabled: true
+    ttl_seconds: 86400
