@@ -401,3 +401,31 @@ ResearchCoordinator
 ---
 
 **等待确认：** 是否按此计划执行？可以针对某个 Phase 进行调整，或者修改架构方案。
+
+---
+
+## 十、实施进度
+
+### Phase 1-4: 已完成 (2026-04-05)
+
+- intel_hub 包结构、数据库层、数据源适配器
+- API 服务层 (sources/collection/archive/knowledge)
+- 知识库引擎 (archive/indexer/search)
+- 调度与监控 (scheduler/monitor)
+
+### Phase 5: 已完成 (前端管理界面)
+
+- **数据源管理页** (`IntelSources.tsx`): 数据源列表、健康检测、启用/禁用切换
+- **采集任务页** (`IntelCollect.tsx`): 任务 CRUD、一键采集、执行日志抽屉
+- **归档与知识库页** (`IntelArchives.tsx`): 归档资料分页浏览、关键词搜索、知识库语义检索
+- API 客户端扩展 (`api.ts`): 新增 20+ 情报中心 API 调用函数
+- 侧边栏新增"情报中心"分组导航 (3个子页面)
+- 路由注册 (`/intel/sources`, `/intel/collect`, `/intel/archives`)
+
+### Phase 6: 已完成 (集成与清理)
+
+- `ResearchCoordinator` 支持双模式数据采集:
+  - 传统模式: `DataCollectorAgent` (默认)
+  - 情报中心模式: `IntelligenceHub` (配置 `intel_hub.enabled=True` 启用)
+- 情报中心采集结果自动转换为 `AgentOutput` 格式，对下游 Agent 透明
+- 情报中心导入失败时自动降级到传统模式

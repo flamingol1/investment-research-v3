@@ -48,6 +48,13 @@ try:
 except ImportError:
     _KB_AVAILABLE = False
 
+# 情报中心为可选依赖，导入失败时使用传统数据采集
+try:
+    from investresearch.intel_hub.service import IntelligenceHub
+    _INTEL_HUB_AVAILABLE = True
+except ImportError:
+    _INTEL_HUB_AVAILABLE = False
+
 logger = get_logger("coordinator")
 
 # 深度模式对应的Agent集
@@ -68,11 +75,22 @@ class ResearchCoordinator:
     def __init__(
         self,
         progress_callback: Callable[[str, str], None] | None = None,
+        use_intel_hub: bool | None = None,
     ) -> None:
         self.config = Config()
         self.llm: LLMRouter = llm_router
         self.progress_callback = progress_callback
         self.logger = get_logger("coordinator")
+
+        # 决定数据采集方式: 情报中心 or 传统 DataCollectorAgent
+        if use_intel_hub is None:
+            use_intel_hub = self.config.get("intel_hub.enabled", False)
+        self._use_intel_hub = use_intel_hub and _INTEL_HUB_AVAILABLE
+
+        if self._use_intel_hub:
+            self.logger.info("数据采集模式: 情报中心 (IntelligenceHub)")
+        else:
+            self.logger.info("数据采集模式: 传统 DataCollectorAgent")
 
     # ================================================================
     # 主入口
@@ -110,9 +128,13 @@ class ResearchCoordinator:
         # Phase 1: 数据采集
         # ========================================
         self._progress("data_collector", f"[数据采集] 采集 {stock_code} 数据...")
-        collector = DataCollectorAgent(cache=FileCache())
-        collector_input = AgentInput(stock_code=stock_code, depth=depth)
-        collector_output = await self._safe_run_agent(collector, collector_input)
+
+        if self._use_intel_hub:
+            collector_output = await self._collect_via_intel_hub(stock_code)
+        else:
+            collector = DataCollectorAgent(cache=FileCache())
+            collector_input = AgentInput(stock_code=stock_code, depth=depth)
+            collector_output = await self._safe_run_agent(collector, collector_input)
 
         if collector_output.status == AgentStatus.SUCCESS:
             context["raw_data"] = collector_output.data
@@ -370,6 +392,68 @@ class ResearchCoordinator:
                 status=AgentStatus.FAILED,
                 errors=[str(e)],
             )
+
+    async def _collect_via_intel_hub(self, stock_code: str) -> AgentOutput:
+        """通过情报中心采集数据，转换为 AgentOutput 格式
+
+        同步的 IntelligenceHub 调用在线程池中执行，避免阻塞事件循环。
+        使用 try/finally 确保 hub 资源始终释放。
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            self._sync_collect_via_intel_hub,
+            stock_code,
+        )
+
+    def _sync_collect_via_intel_hub(self, stock_code: str) -> AgentOutput:
+        """同步执行情报中心采集（在线程池中调用）"""
+        hub = IntelligenceHub()
+        try:
+            hub.initialize()
+            results = hub.collect_stock(stock_code)
+
+            # 将采集结果转换为 CollectorOutput 兼容格式
+            collected_data: dict[str, Any] = {}
+            collection_status: dict[str, str] = {}
+            collection_errors: list[str] = []
+            success_count = 0
+
+            for r in results:
+                if r.status in ("success", "partial"):
+                    collected_data[r.data_type] = r.data
+                    collection_status[r.data_type] = r.status
+                    success_count += 1
+                else:
+                    collection_status[r.data_type] = "failed"
+                    if r.error:
+                        collection_errors.append(f"{r.data_type}: {r.error}")
+
+            total = len(results)
+            coverage_ratio = success_count / total if total > 0 else 0.0
+
+            return AgentOutput(
+                agent_name="intel_hub_collector",
+                status=AgentStatus.SUCCESS if success_count > 0 else AgentStatus.FAILED,
+                data={
+                    **collected_data,
+                    "collection_status": collection_status,
+                    "coverage_ratio": coverage_ratio,
+                    "errors": collection_errors,
+                },
+                data_sources=list({r.source_name for r in results}),
+                confidence=coverage_ratio,
+                summary=f"情报中心采集{total}类数据，成功{success_count}，覆盖率{coverage_ratio:.0%}",
+            )
+        except Exception as e:
+            self.logger.error(f"情报中心采集异常: {e}")
+            return AgentOutput(
+                agent_name="intel_hub_collector",
+                status=AgentStatus.FAILED,
+                errors=[str(e)],
+            )
+        finally:
+            hub.close()
 
     def _progress(self, step: str, message: str) -> None:
         """报告进度"""

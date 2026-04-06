@@ -6,7 +6,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -44,12 +44,18 @@ class CollectionEngine:
         self._archive_repo = ArchiveRepository(session)
         self._source_repo = SourceRepository(session)
 
-    def collect_stock(self, stock_code: str, data_types: list[str] | None = None) -> list[CollectionResult]:
+    def collect_stock(
+        self,
+        stock_code: str,
+        data_types: list[str] | None = None,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> list[CollectionResult]:
         """采集指定股票的多种数据
 
         Args:
             stock_code: 股票代码
             data_types: 要采集的数据类型列表，None 表示全部
+            progress_callback: 可选进度回调，接收 (event_type, detail)
 
         Returns:
             各类型的采集结果列表
@@ -57,10 +63,41 @@ class CollectionEngine:
         if data_types is None:
             data_types = ALL_DATA_TYPES
 
+        total = len(data_types)
+        if progress_callback:
+            progress_callback("started", {"total_steps": total, "stock_code": stock_code})
+
         results: list[CollectionResult] = []
-        for dt in data_types:
+        for idx, dt in enumerate(data_types):
+            if progress_callback:
+                display_name = TASK_TYPE_DEFINITIONS.get(dt)
+                progress_callback("step_start", {
+                    "data_type": dt,
+                    "display_name": display_name.display_name if display_name else dt,
+                    "step": idx + 1,
+                    "total": total,
+                })
+
             result = self.collect_one(stock_code, dt)
             results.append(result)
+
+            if progress_callback:
+                progress_callback("step_complete", {
+                    "data_type": dt,
+                    "source": result.source_name,
+                    "status": result.status,
+                    "records_fetched": result.records_fetched,
+                    "duration_ms": result.duration_ms,
+                    "error": result.error,
+                    "step": idx + 1,
+                    "total": total,
+                    "progress": round((idx + 1) / total, 2),
+                })
+
+        if progress_callback:
+            success = sum(1 for r in results if r.status == "success")
+            failed = sum(1 for r in results if r.status == "failed")
+            progress_callback("done", {"success_count": success, "failed_count": failed})
 
         return results
 
@@ -129,7 +166,11 @@ class CollectionEngine:
 
         return result
 
-    def run_task(self, task_id: int) -> list[CollectionResult]:
+    def run_task(
+        self,
+        task_id: int,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> list[CollectionResult]:
         """执行指定的采集任务"""
         task = self._task_repo.get_by_id(task_id)
         if task is None:
@@ -141,10 +182,23 @@ class CollectionEngine:
 
         # 确定要采集的数据类型
         data_types = [task.task_type] if task.task_type != "all" else ALL_DATA_TYPES
+        total = len(data_types)
+
+        if progress_callback:
+            progress_callback("started", {"total_steps": total, "stock_code": task.target})
 
         results: list[CollectionResult] = []
         try:
-            for dt in data_types:
+            for idx, dt in enumerate(data_types):
+                if progress_callback:
+                    display_name = TASK_TYPE_DEFINITIONS.get(dt)
+                    progress_callback("step_start", {
+                        "data_type": dt,
+                        "display_name": display_name.display_name if display_name else dt,
+                        "step": idx + 1,
+                        "total": total,
+                    })
+
                 source_name = None
                 if task.source_id:
                     source = self._source_repo.get_by_id(task.source_id)
@@ -185,13 +239,33 @@ class CollectionEngine:
                     log.id, result.status, stored, result.error or ""
                 )
 
+                if progress_callback:
+                    progress_callback("step_complete", {
+                        "data_type": dt,
+                        "source": result.source_name,
+                        "status": result.status,
+                        "records_fetched": result.records_fetched,
+                        "duration_ms": result.duration_ms,
+                        "error": result.error,
+                        "step": idx + 1,
+                        "total": total,
+                        "progress": round((idx + 1) / total, 2),
+                    })
+
             all_success = all(r.status == "success" for r in results)
             self._task_repo.mark_completed(task_id, all_success)
             self._session.commit()
 
+            if progress_callback:
+                success = sum(1 for r in results if r.status == "success")
+                failed = sum(1 for r in results if r.status == "failed")
+                progress_callback("done", {"success_count": success, "failed_count": failed})
+
         except Exception as e:
             self._task_repo.mark_completed(task_id, False)
             self._session.commit()
+            if progress_callback:
+                progress_callback("error", {"error": str(e)})
             raise
 
         return results

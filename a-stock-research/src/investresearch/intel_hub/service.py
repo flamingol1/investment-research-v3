@@ -313,6 +313,39 @@ class IntelligenceHub:
             session.close()
 
     # ================================================================
+    # 流式采集 (带进度回调)
+    # ================================================================
+
+    def collect_stock_streaming(
+        self,
+        stock_code: str,
+        progress_callback: Any,
+        data_types: list[str] | None = None,
+    ) -> list[CollectionResult]:
+        """带进度回调的一键采集"""
+        self._ensure_initialized()
+        session = self._db.get_session()
+        try:
+            engine = CollectionEngine(session, self._registry)
+            return engine.collect_stock(stock_code, data_types, progress_callback=progress_callback)
+        finally:
+            session.close()
+
+    def run_task_streaming(
+        self,
+        task_id: int,
+        progress_callback: Any,
+    ) -> list[CollectionResult]:
+        """带进度回调的任务执行"""
+        self._ensure_initialized()
+        session = self._db.get_session()
+        try:
+            engine = CollectionEngine(session, self._registry)
+            return engine.run_task(task_id, progress_callback=progress_callback)
+        finally:
+            session.close()
+
+    # ================================================================
     # 归档与知识库
     # ================================================================
 

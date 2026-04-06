@@ -8,11 +8,13 @@ from .sources_api import router as sources_router
 from .collection_api import router as collection_router
 from .archive_api import router as archive_router
 from .knowledge_api import router as knowledge_router
+from .collection_stream_api import router as stream_router
 
 intel_router = APIRouter(prefix="/api/intel", tags=["情报中心"])
 
 intel_router.include_router(sources_router)
 intel_router.include_router(collection_router)
+intel_router.include_router(stream_router)
 intel_router.include_router(archive_router)
 intel_router.include_router(knowledge_router)
 

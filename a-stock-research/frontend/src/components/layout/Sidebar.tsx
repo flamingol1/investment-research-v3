@@ -10,6 +10,7 @@ import {
   HistoryOutlined,
   EyeOutlined,
   BulbOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons';
 import { useAppStore } from '../../lib/store';
 
@@ -19,6 +20,12 @@ const menuItems = [
   { key: '/watch', icon: <EyeOutlined />, label: '监控列表' },
   { key: '/history', icon: <HistoryOutlined />, label: '研究历史' },
   { key: '/search', icon: <FundOutlined />, label: '知识库搜索' },
+];
+
+const intelItems = [
+  { key: '/intel/sources', label: '数据源管理' },
+  { key: '/intel/collect', label: '采集任务' },
+  { key: '/intel/archives', label: '归档与知识库' },
 ];
 
 const Sidebar: React.FC = () => {
@@ -57,7 +64,7 @@ const Sidebar: React.FC = () => {
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 py-3 px-2 space-y-1">
+      <nav className="flex-1 py-3 px-2 space-y-1 overflow-y-auto">
         {menuItems.map((item) => {
           const isActive = location.pathname === item.key ||
             (item.key !== '/' && location.pathname.startsWith(item.key));
@@ -74,6 +81,35 @@ const Sidebar: React.FC = () => {
               title={collapsed ? item.label : undefined}
             >
               <span className="text-lg">{item.icon}</span>
+              {!collapsed && <span>{item.label}</span>}
+            </button>
+          );
+        })}
+
+        {/* Intelligence Hub Section */}
+        {!collapsed && (
+          <div className="pt-4 pb-1 px-3">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+              情报中心
+            </span>
+          </div>
+        )}
+        {collapsed && <div className="my-2 border-t" style={{ borderColor: 'var(--color-border)' }} />}
+        {intelItems.map((item) => {
+          const isActive = location.pathname === item.key;
+          return (
+            <button
+              key={item.key}
+              onClick={() => navigate(item.key)}
+              className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+                isActive
+                  ? 'text-white'
+                  : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
+              }`}
+              style={isActive ? { background: 'var(--color-brand)' } : undefined}
+              title={collapsed ? item.label : undefined}
+            >
+              <span className="text-lg"><DatabaseOutlined /></span>
               {!collapsed && <span>{item.label}</span>}
             </button>
           );
