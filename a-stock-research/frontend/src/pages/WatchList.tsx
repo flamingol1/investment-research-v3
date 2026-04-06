@@ -10,7 +10,10 @@ import {
 } from '@ant-design/icons';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  getWatchList, addToWatch, removeFromWatch, triggerUpdate,
+  addToWatch,
+  getWatchList,
+  removeFromWatch,
+  triggerUpdate,
   type WatchListItem as WatchItem,
 } from '../lib/api';
 
@@ -25,9 +28,9 @@ const statusMap: Record<string, { color: string; label: string }> = {
 const recColor: Record<string, string> = {
   '买入(强烈)': 'red',
   '买入(谨慎)': 'volcano',
-  '持有': 'orange',
-  '观望': 'blue',
-  '卖出': 'green',
+  持有: 'orange',
+  观望: 'blue',
+  卖出: 'green',
 };
 
 const WatchListPage: React.FC = () => {
@@ -64,9 +67,14 @@ const WatchListPage: React.FC = () => {
   const updateMutation = useMutation({
     mutationFn: triggerUpdate,
     onSuccess: (resp) => {
-      message.success(resp.message || '更新已触发');
+      if (resp.status === 'failed') {
+        message.warning(resp.message || '更新失败');
+      } else {
+        message.success(resp.message || '更新完成');
+      }
       queryClient.invalidateQueries({ queryKey: ['watch'] });
     },
+    onError: () => message.error('更新失败'),
   });
 
   const items = watchData?.items ?? [];
@@ -105,8 +113,8 @@ const WatchListPage: React.FC = () => {
       dataIndex: 'status',
       key: 'status',
       width: 80,
-      render: (s: string) => {
-        const cfg = statusMap[s] || { color: 'default', label: s };
+      render: (status: string) => {
+        const cfg = statusMap[status] || { color: 'default', label: status };
         return <Tag color={cfg.color}>{cfg.label}</Tag>;
       },
     },
@@ -115,9 +123,9 @@ const WatchListPage: React.FC = () => {
       dataIndex: 'last_updated_at',
       key: 'updated',
       width: 140,
-      render: (d: string | null) => (
+      render: (dateText: string | null) => (
         <Text style={{ color: 'var(--color-text-muted)', fontSize: 13 }}>
-          {d ? new Date(d).toLocaleDateString('zh-CN') : '-'}
+          {dateText ? new Date(dateText).toLocaleDateString('zh-CN') : '-'}
         </Text>
       ),
     },
@@ -136,7 +144,7 @@ const WatchListPage: React.FC = () => {
             更新
           </Button>
           <Popconfirm
-            title={`确定移除 ${record.stock_code}?`}
+            title={`确定移除 ${record.stock_code} ?`}
             onConfirm={() => removeMutation.mutate(record.stock_code)}
           >
             <Button size="small" danger icon={<DeleteOutlined />}>
@@ -170,11 +178,10 @@ const WatchListPage: React.FC = () => {
           loading={isLoading}
           pagination={false}
           size="middle"
-          locale={{ emptyText: '暂无监控标的，点击"添加标的"开始' }}
+          locale={{ emptyText: '暂无监控标的，点击“添加标的”开始' }}
         />
       </Card>
 
-      {/* 添加Modal */}
       <Modal
         title="添加监控标的"
         open={addModalOpen}
@@ -197,7 +204,7 @@ const WatchListPage: React.FC = () => {
           <div>
             <Text style={{ color: 'var(--color-text-secondary)' }}>股票名称（可选）</Text>
             <Input
-              placeholder="如 湖南裕能"
+              placeholder="如 贵州茅台"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               className="mt-1"

@@ -59,6 +59,16 @@ LAYER_DEFAULTS: dict[str, str] = {
     "reporting": "qwen3-coder",
 }
 
+MODEL_FALLBACKS: dict[str, list[str]] = {
+    "qwen3-max": ["qwen3-plus", "qwen3-coder", "doubao-pro", "doubao-lite"],
+    "qwen3-plus": ["qwen3-coder", "doubao-pro", "doubao-lite"],
+    "qwen3-coder": ["qwen3-plus", "doubao-pro", "doubao-lite"],
+    "qwen3-coder-plus": ["qwen3-plus", "qwen3-coder", "doubao-pro"],
+    "doubao-pro": ["qwen3-plus", "qwen3-coder", "doubao-lite"],
+    "doubao-lite": ["qwen3-plus", "qwen3-coder"],
+    "deepseek-v3.2": ["qwen3-plus", "qwen3-coder", "doubao-pro"],
+}
+
 
 class LLMRouter:
     """LLM双提供商路由器
@@ -202,6 +212,52 @@ class LLMRouter:
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
+    def _fallback_candidates(self, model: str) -> list[str]:
+        """Return an ordered list of backup models for the given primary model."""
+        configured = MODEL_FALLBACKS.get(model, [])
+        defaults = ["qwen3-plus", "qwen3-coder", "doubao-pro", "doubao-lite"]
+        candidates: list[str] = []
+        for candidate in [*configured, *defaults]:
+            if candidate == model or candidate not in MODEL_ALIASES:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    async def _call_with_fallback_models(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str | None,
+        primary_model: str,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> str:
+        """Retry a rate-limited request against backup models."""
+        fallback_models = self._fallback_candidates(primary_model)
+        last_error: Exception | None = None
+
+        for fallback_model in fallback_models:
+            try:
+                logger.warning(
+                    f"LLM主模型限流，切换备用模型 | primary={primary_model} -> fallback={fallback_model}"
+                )
+                return await self.call(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=fallback_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    allow_fallback=False,
+                )
+            except (LLMError, LLMRateLimitError) as exc:
+                last_error = exc
+                logger.warning(f"备用模型调用失败 | model={fallback_model} | error={exc}")
+
+        if last_error is not None:
+            raise last_error
+        raise LLMRateLimitError("fallback", 60)
+
     # ============================================================
     # 统一调用接口
     # ============================================================
@@ -213,6 +269,7 @@ class LLMRouter:
         model: str = "qwen3-plus",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        allow_fallback: bool = True,
     ) -> str:
         """调用LLM
 
@@ -257,7 +314,17 @@ class LLMRouter:
             self._record_usage(model, len(content))
             return content
 
-        except (LLMError, LLMRateLimitError):
+        except LLMRateLimitError:
+            if allow_fallback:
+                return await self._call_with_fallback_models(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    primary_model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            raise
+        except LLMError:
             raise
         except RuntimeError as e:
             if "Event loop is closed" in str(e):

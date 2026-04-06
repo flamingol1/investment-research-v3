@@ -70,6 +70,83 @@ class AgentStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class DataQualityStatus(str, Enum):
+    """数据质量状态"""
+    OK = "ok"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class MonitoringLayer(str, Enum):
+    """跟踪层级"""
+    LEADING = "leading"
+    VALIDATION = "validation"
+    RISK_TRIGGER = "risk_trigger"
+
+
+# ============================================================
+# 通用证据/数据质量模型
+# ============================================================
+
+
+class EvidenceRef(BaseModel):
+    """可追溯证据引用"""
+    source: str = Field(default="", description="来源站点或数据源")
+    source_priority: int = Field(default=99, description="来源优先级，数值越小越靠前")
+    title: str = Field(default="", description="资料标题")
+    field: str = Field(default="", description="支撑字段")
+    excerpt: str = Field(default="", description="摘录内容")
+    url: str = Field(default="", description="资料链接")
+    reference_date: str = Field(default="", description="资料日期")
+
+
+class ModuleQualityProfile(BaseModel):
+    """单个模块的数据质量画像"""
+    status: DataQualityStatus = Field(default=DataQualityStatus.FAILED, description="ok/partial/failed")
+    completeness: float = Field(default=0.0, ge=0, le=1, description="完整度 0-1")
+    missing_fields: list[str] = Field(default_factory=list, description="缺失关键字段")
+    source_priority: list[str] = Field(default_factory=list, description="已使用的来源优先级顺序")
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="关键证据引用")
+    notes: list[str] = Field(default_factory=list, description="模块说明")
+
+
+class MonitoringPlanItem(BaseModel):
+    """结论卡跟踪计划项"""
+    layer: MonitoringLayer = Field(description="跟踪层级")
+    metric: str = Field(description="跟踪指标")
+    trigger: str = Field(default="", description="触发条件")
+    update_frequency: str = Field(default="", description="更新频率")
+    rationale: str = Field(default="", description="跟踪原因")
+
+
+class ChartSeries(BaseModel):
+    """图表序列"""
+    name: str = Field(description="序列名称")
+    points: list[dict[str, Any]] = Field(default_factory=list, description="图表点位")
+
+
+class ChartPackItem(BaseModel):
+    """图表包条目"""
+    chart_id: str = Field(description="图表标识")
+    title: str = Field(description="图表标题")
+    chart_type: str = Field(default="line", description="图表类型")
+    unit: str = Field(default="", description="数值单位")
+    summary: str = Field(default="", description="图表解读")
+    series: list[ChartSeries] = Field(default_factory=list, description="图表序列")
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="图表证据")
+
+
+class EvidencePackItem(BaseModel):
+    """证据包条目"""
+    category: str = Field(description="证据分类")
+    title: str = Field(description="标题")
+    source: str = Field(default="", description="来源")
+    url: str = Field(default="", description="链接")
+    excerpt: str = Field(default="", description="摘录")
+    fields: list[str] = Field(default_factory=list, description="支撑字段")
+    reference_date: str = Field(default="", description="日期")
+
+
 # ============================================================
 # 数据层模型
 # ============================================================
@@ -141,12 +218,16 @@ class FinancialStatement(BaseModel):
     financing_cashflow: float | None = Field(default=None, description="筹资现金流(元)")
     free_cashflow: float | None = Field(default=None, description="自由现金流(元)")
     cash_to_profit: float | None = Field(default=None, description="净现比")
+    capex_maintenance: float | None = Field(default=None, description="维护性资本开支(元)")
+    capex_expansion: float | None = Field(default=None, description="扩张性资本开支(元)")
 
     # 质量指标
     roe: float | None = Field(default=None, description="ROE(%)")
     roic: float | None = Field(default=None, description="ROIC(%)")
     receivable_turnover: float | None = Field(default=None, description="应收周转率")
     inventory_turnover: float | None = Field(default=None, description="存货周转率")
+    non_recurring_profit: float | None = Field(default=None, description="非经常性损益(元)")
+    contract_liabilities: float | None = Field(default=None, description="合同负债(元)")
 
     # 原始数据
     raw_data: dict[str, Any] | None = Field(default=None, description="原始数据JSON")
@@ -187,11 +268,21 @@ class CollectorOutput(BaseModel):
     valuation_percentile: ValuationPercentile | None = Field(default=None, description="估值分位数据")
     news: list[NewsData] = Field(default_factory=list, description="新闻数据")
     sentiment: SentimentData | None = Field(default=None, description="舆情情绪数据")
+    policy_documents: list[PolicyDocument] = Field(default_factory=list, description="政策原文资料")
+
+    compliance_events: list[ComplianceEvent] = Field(default_factory=list, description="官方合规/监管事件")
+    patents: list[PatentRecord] = Field(default_factory=list, description="官方专利/技术资料")
 
     collection_status: dict[str, str] = Field(
         default_factory=dict,
         description="采集状态: data_type -> ok/partial/failed",
     )
+    module_profiles: dict[str, ModuleQualityProfile] = Field(default_factory=dict, description="模块数据质量画像")
+    status: DataQualityStatus = Field(default=DataQualityStatus.PARTIAL, description="整体数据状态")
+    completeness: float = Field(default=0.0, ge=0, le=1, description="整体关键字段完整度")
+    missing_fields: list[str] = Field(default_factory=list, description="整体关键缺失字段")
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="整体关键证据")
+    source_priority: list[str] = Field(default_factory=list, description="整体来源优先级")
     coverage_ratio: float = Field(default=0.0, ge=0, le=1, description="覆盖率0-1")
     errors: list[str] = Field(default_factory=list)
     collected_at: datetime = Field(default_factory=datetime.now)
@@ -456,11 +547,20 @@ class InvestmentConclusion(BaseModel):
     risk_level: str = Field(description="风险等级: 低/中/高/极高")
     key_reasons_buy: list[str] = Field(default_factory=list, description="买入理由")
     key_reasons_sell: list[str] = Field(default_factory=list, description="卖出/观望理由")
+    core_thesis: list[str] = Field(default_factory=list, description="核心投资逻辑")
+    expectation_gap: str = Field(default="", description="预期差判断")
+    catalysts: list[str] = Field(default_factory=list, description="催化剂")
     key_assumptions: list[str] = Field(default_factory=list, description="核心假设")
+    valuation_range: str = Field(default="", description="估值区间说明")
+    return_breakdown: list[str] = Field(default_factory=list, description="收益来源拆解")
+    major_risks: list[str] = Field(default_factory=list, description="主要风险")
+    failure_conditions: list[str] = Field(default_factory=list, description="逻辑失效条件")
     monitoring_points: list[str] = Field(default_factory=list, description="需跟踪的指标")
+    monitoring_plan: list[MonitoringPlanItem] = Field(default_factory=list, description="分层跟踪计划")
     position_advice: str = Field(default="", description="仓位建议")
     holding_period: str = Field(default="", description="建议持有周期")
     stop_loss_price: float | None = Field(default=None, description="止损价")
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="结论证据")
     conclusion_summary: str = Field(description="一段话结论")
 
 
@@ -474,6 +574,8 @@ class ResearchReport(BaseModel):
     depth: str = Field(default="standard", description="研究深度")
     markdown: str = Field(default="", description="完整Markdown报告内容")
     conclusion: InvestmentConclusion | None = Field(default=None, description="投资结论")
+    chart_pack: list[ChartPackItem] = Field(default_factory=list, description="图表包")
+    evidence_pack: list[EvidencePackItem] = Field(default_factory=list, description="证据包")
     agents_completed: list[str] = Field(default_factory=list, description="已完成的Agent")
     agents_skipped: list[str] = Field(default_factory=list, description="跳过的Agent")
     errors: list[str] = Field(default_factory=list, description="错误列表")
@@ -560,6 +662,8 @@ class ResearchHistoryEntry(BaseModel):
     target_price_high: float | None = None
     current_price: float | None = None
     report_path: str | None = None
+    chart_pack_path: str | None = None
+    evidence_pack_path: str | None = None
     agents_completed: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
@@ -577,9 +681,16 @@ class Announcement(BaseModel):
     title: str = Field(description="公告标题")
     announcement_type: str = Field(default="", description="公告类型: 年报/季报/半年报/临时公告/问询函等")
     announcement_date: date | None = Field(default=None, description="公告日期")
+    announcement_id: str = Field(default="", description="公告ID")
     source: str = Field(default="cninfo", description="来源")
     url: str = Field(default="", description="原文链接")
+    pdf_url: str = Field(default="", description="PDF原文链接")
     summary: str = Field(default="", description="摘要内容")
+    excerpt: str = Field(default="", description="原文摘录")
+    highlights: list[str] = Field(default_factory=list, description="原文关键信息")
+    structured_fields: dict[str, Any] = Field(default_factory=dict, description="结构化抽取字段")
+    page_count: int | None = Field(default=None, description="PDF页数")
+    full_text_available: bool = Field(default=False, description="是否已提取原文")
 
 
 class GovernanceData(BaseModel):
@@ -598,6 +709,9 @@ class GovernanceData(BaseModel):
     lawsuit_info: str = Field(default="", description="诉讼/仲裁信息")
     # 高管增减持
     management_changes: list[dict[str, Any]] = Field(default_factory=list, description="高管增减持记录")
+    dividend_history: list[dict[str, Any]] = Field(default_factory=list, description="分红历史")
+    buyback_history: list[dict[str, Any]] = Field(default_factory=list, description="回购历史")
+    refinancing_history: list[dict[str, Any]] = Field(default_factory=list, description="再融资历史")
 
 
 # --- Sprint 2: 研报与股东 ---
@@ -610,7 +724,57 @@ class ResearchReportSummary(BaseModel):
     rating: str = Field(default="", description="评级: 买入/增持/中性/减持")
     target_price: float | None = Field(default=None, description="目标价")
     publish_date: date | None = Field(default=None, description="发布日期")
+    industry: str = Field(default="", description="所属行业")
+    pdf_url: str = Field(default="", description="PDF原文链接")
     summary: str = Field(default="", description="核心观点摘要(200字内)")
+    excerpt: str = Field(default="", description="原文摘录")
+    highlights: list[str] = Field(default_factory=list, description="原文关键信息")
+    page_count: int | None = Field(default=None, description="PDF页数")
+
+
+class PolicyDocument(BaseModel):
+    """政策原文资料"""
+    title: str = Field(description="政策标题")
+    source: str = Field(default="gov.cn", description="来源站点")
+    policy_date: date | None = Field(default=None, description="发布日期")
+    issuing_body: str = Field(default="", description="发布机构")
+    document_type: str = Field(default="", description="文种/分类")
+    url: str = Field(default="", description="原文链接")
+    summary: str = Field(default="", description="摘要内容")
+    excerpt: str = Field(default="", description="原文摘录")
+    highlights: list[str] = Field(default_factory=list, description="原文关键信息")
+    matched_keywords: list[str] = Field(default_factory=list, description="命中关键词")
+
+
+class ComplianceEvent(BaseModel):
+    """官方合规/监管事件"""
+    title: str = Field(description="事件标题")
+    source: str = Field(default="", description="来源站点")
+    publish_date: date | None = Field(default=None, description="发布日期")
+    event_type: str = Field(default="", description="事件类型")
+    severity: str = Field(default="", description="风险等级提示")
+    related_party: str = Field(default="", description="关联主体")
+    url: str = Field(default="", description="原文链接")
+    summary: str = Field(default="", description="摘要")
+    excerpt: str = Field(default="", description="原文摘录")
+    raw_tags: list[str] = Field(default_factory=list, description="结构化标签")
+
+
+class PatentRecord(BaseModel):
+    """官方专利/技术资料"""
+    title: str = Field(description="专利名称或技术标题")
+    source: str = Field(default="", description="来源站点")
+    publish_date: date | None = Field(default=None, description="公开/发布时间")
+    patent_type: str = Field(default="", description="专利类型")
+    application_no: str = Field(default="", description="申请号")
+    patent_no: str = Field(default="", description="专利号")
+    legal_status: str = Field(default="", description="法律状态")
+    assignee: str = Field(default="", description="申请人/权利人")
+    inventors: list[str] = Field(default_factory=list, description="发明人")
+    summary: str = Field(default="", description="摘要")
+    excerpt: str = Field(default="", description="原文摘录")
+    url: str = Field(default="", description="原文链接")
+    keywords: list[str] = Field(default_factory=list, description="技术关键词")
 
 
 class ShareholderData(BaseModel):
@@ -631,16 +795,26 @@ class IndustryEnhancedData(BaseModel):
     industry_name: str = Field(description="行业名称")
     industry_code: str | None = Field(default=None, description="行业代码")
     industry_level: str | None = Field(default=None, description="行业分级: 一级行业/二级行业/三级行业")
+    industry_description: str = Field(default="", description="行业简介")
     # 行业指数
     industry_index_close: float | None = Field(default=None, description="行业指数收盘价")
     industry_change_pct: float | None = Field(default=None, description="行业涨跌幅(%)")
     industry_pe: float | None = Field(default=None, description="行业整体PE")
     industry_pb: float | None = Field(default=None, description="行业整体PB")
+    industry_turnover_volume: float | None = Field(default=None, description="行业成交量")
+    industry_turnover_amount: float | None = Field(default=None, description="行业成交额(亿)")
+    industry_fund_flow: float | None = Field(default=None, description="行业资金净流入(亿)")
+    industry_rank: str = Field(default="", description="行业涨幅排名")
+    rising_count: int | None = Field(default=None, description="上涨家数")
+    falling_count: int | None = Field(default=None, description="下跌家数")
+    industry_ytd_change_pct: float | None = Field(default=None, description="行业年初至今涨跌幅(%)")
+    industry_1y_change_pct: float | None = Field(default=None, description="行业近一年涨跌幅(%)")
     # 行业排名
     stock_rank_in_industry: int | None = Field(default=None, description="个股在行业中排名")
     total_in_industry: int | None = Field(default=None, description="行业内公司总数")
     # 领涨/领跌
     industry_leaders: list[str] = Field(default_factory=list, description="行业龙头/领涨股")
+    data_points: list[str] = Field(default_factory=list, description="关键行业数据点")
 
 
 class ValuationPercentile(BaseModel):

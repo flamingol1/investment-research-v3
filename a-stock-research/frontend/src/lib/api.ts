@@ -1,5 +1,5 @@
 /**
- * API客户端 - 统一的后端通信层
+ * Frontend API client.
  */
 import axios from 'axios';
 
@@ -8,10 +8,6 @@ const api = axios.create({
   timeout: 30000,
   headers: { 'Content-Type': 'application/json' },
 });
-
-// ============================================================
-// 类型定义
-// ============================================================
 
 export interface ResearchRequest {
   stock_code: string;
@@ -31,6 +27,12 @@ export interface ResearchStatus {
   progress: number;
   stage: string;
   current_agent: string;
+  message: string;
+  stage_detail: ProgressDetail | null;
+  data_summary: ProgressMetric[];
+  recent_events: ResearchEvent[];
+  completed_agents: string[];
+  active_agents: string[];
   started_at: string | null;
   completed_at: string | null;
   report: ReportSummary | null;
@@ -56,6 +58,7 @@ export interface ReportDetail {
   stock_code: string;
   stock_name: string;
   report_date: string;
+  depth: string;
   markdown: string;
   conclusion: InvestmentConclusion | null;
   agents_completed: string[];
@@ -136,11 +139,33 @@ export interface SearchResponse {
   query: string;
   results: SearchItem[];
   total: number;
+  warning?: string;
 }
 
-// ============================================================
-// WebSocket 进度消息
-// ============================================================
+export interface SecurityLookupItem {
+  stock_code: string;
+  stock_name: string;
+  exchange: string;
+  has_report: boolean;
+  in_watchlist: boolean;
+}
+
+export interface SecurityLookupResponse {
+  query: string;
+  items: SecurityLookupItem[];
+  total: number;
+  source: string;
+  fallback: boolean;
+}
+
+export interface UpdateResponse {
+  stock_code: string;
+  status: 'success' | 'failed';
+  message: string;
+  changes: Record<string, number>;
+  duration_seconds: number;
+  errors: string[];
+}
 
 export interface ProgressMessage {
   stage: string;
@@ -148,6 +173,37 @@ export interface ProgressMessage {
   status: string;
   progress: number;
   message: string;
+  stage_detail?: ProgressDetail | null;
+  data_summary?: ProgressMetric[];
+  recent_events?: ResearchEvent[];
+  completed_agents?: string[];
+  active_agents?: string[];
+  event?: ResearchEvent | null;
+  timestamp?: string;
+}
+
+export interface ProgressMetric {
+  key: string;
+  label: string;
+  value: string;
+  tone: 'default' | 'info' | 'success' | 'warning' | 'danger';
+}
+
+export interface ProgressDetail {
+  headline: string;
+  note: string;
+  metrics: ProgressMetric[];
+  bullets: string[];
+}
+
+export interface ResearchEvent {
+  id: number;
+  stage: string;
+  agent: string;
+  status: 'running' | 'completed' | 'failed';
+  message: string;
+  created_at: string;
+  detail?: ProgressDetail | null;
 }
 
 export function connectResearchWS(
@@ -156,7 +212,7 @@ export function connectResearchWS(
   onClose?: () => void,
 ): WebSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${protocol}//${window.location.host}/ws/research/${taskId}`);
+  const ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/research/${taskId}`);
 
   ws.onmessage = (event) => {
     try {
@@ -173,10 +229,6 @@ export function connectResearchWS(
 
   return ws;
 }
-
-// ============================================================
-// API 调用函数
-// ============================================================
 
 export async function startResearch(req: ResearchRequest): Promise<ApiResponse<{ task_id: string }>> {
   const { data } = await api.post('/research', req);
@@ -223,7 +275,17 @@ export async function searchKnowledge(req: SearchRequest): Promise<SearchRespons
   return data;
 }
 
-export async function triggerUpdate(stockCode: string): Promise<ApiResponse> {
+export async function searchSecurities(query: string, limit = 8): Promise<SecurityLookupResponse> {
+  const { data } = await api.get('/securities/search', {
+    params: {
+      q: query,
+      limit,
+    },
+  });
+  return data;
+}
+
+export async function triggerUpdate(stockCode: string): Promise<UpdateResponse> {
   const { data } = await api.post(`/update/${stockCode}`);
   return data;
 }

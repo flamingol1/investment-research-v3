@@ -1,11 +1,4 @@
-"""商业模式Agent - 盈利结构拆解、护城河验证、反证视角
-
-分析维度:
-1. 收入结构拆解: 分产品/分地区/分业务线的营收和利润贡献
-2. 盈利模式分析: 资产模式(轻/重)、客户类型、定价权
-3. 护城河识别: 品牌/网络效应/转换成本/成本优势/规模效应
-4. 反证视角: 为什么这个商业模式可能失败
-"""
+"""Deterministic business-model analysis agent."""
 
 from __future__ import annotations
 
@@ -13,92 +6,20 @@ from typing import Any
 
 from investresearch.core.agent_base import AgentBase
 from investresearch.core.logging import get_logger
-from investresearch.core.models import (
-    AgentInput,
-    AgentOutput,
-    AgentStatus,
-)
+from investresearch.core.models import AgentInput, AgentOutput, AgentStatus
+from investresearch.core.trust import get_module_profile, merge_evidence_refs
 
 logger = get_logger("agent.business_model")
 
-SYSTEM_PROMPT = """你是一位专业的A股商业模式分析师，擅长拆解企业盈利逻辑和识别竞争壁垒。
-
-## 你的任务
-对给定股票进行商业模式深度分析，包含盈利结构拆解、护城河验证和反证审视。
-
-## 分析框架
-### 1. 收入结构拆解
-- 按产品线/业务板块拆分收入和利润贡献
-- 按地区拆分（如有数据）
-- 识别最大收入来源和增长最快的业务
-- 计算各业务线占比和趋势
-
-### 2. 盈利模式分析
-- **资产模式**: 轻/重/混合，判断依据（资产周转率、固定资产占比）
-- **客户类型**: ToB/ToC/ToG，集中度如何
-- **定价权**: 是否能持续提价或维持高毛利
-- **核心盈利驱动力**: 量驱动？价驱动？份额驱动？
-- **合同类型**: 订单制/订阅制/项目制（判断收入可预测性）
-
-### 3. 护城河识别（至少分析3种）
-- **品牌壁垒**: 品牌溢价能力、复购率、用户粘性
-- **网络效应**: 用户越多价值越大、双边网络
-- **转换成本**: 客户更换供应商的成本和风险
-- **成本优势**: 规模效应、独特资源、工艺壁垒
-- **规模效应**: 产量/渠道/研发投入的规模经济
-- **专利/牌照**: 技术壁垒、行政许可
-
-### 4. 反证视角（必须包含）
-- 列出3个该商业模式最可能失败的路径
-- 历史上同行业失败的案例教训
-- 技术颠覆/政策变化对该模式的影响
-
-## 输出格式（严格JSON）
-```json
-{
-  "model_score": 7.5,
-  "revenue_structure": [
-    {
-      "segment_name": "产品/业务名称",
-      "revenue": 1000000000,
-      "ratio": 45.5,
-      "growth": 12.3,
-      "gross_margin": 35.0
-    }
-  ],
-  "profit_driver": "核心盈利驱动力说明",
-  "asset_model": "轻/重/混合",
-  "client_concentration": "客户集中度评估",
-  "moats": [
-    {
-      "moat_type": "品牌/网络效应/转换成本/成本优势/规模效应/专利/无",
-      "strength": "强/中/弱/无",
-      "evidence": "支撑证据",
-      "sustainability": "可持续性判断"
-    }
-  ],
-  "moat_overall": "宽/窄/无",
-  "negative_view": "为什么这个商业模式可能失败（反证视角）",
-  "conclusion": "商业模式综合结论"
-}
-```
-
-## 重要约束
-- revenue_structure至少拆解2个维度
-- moats至少分析3种护城河可能性
-- negative_view必须包含至少3个失败路径
-- 所有评分必须有数据引用
-- moat_overall只能取"宽"/"窄"/"无"三个值
-"""
+SYSTEM_PROMPT = "Business model analysis is implemented deterministically in this build."
 
 
 class BusinessModelAgent(AgentBase[AgentInput, AgentOutput]):
-    """商业模式Agent - 盈利结构拆解、护城河验证、反证视角"""
+    """Analyze business model, moats, and negative cases conservatively."""
 
     agent_name: str = "business_model"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
-        """执行商业模式分析"""
         cleaned = input_data.context.get("cleaned_data", {})
         if not cleaned:
             return AgentOutput(
@@ -111,178 +32,243 @@ class BusinessModelAgent(AgentBase[AgentInput, AgentOutput]):
         stock_name = input_data.stock_name or cleaned.get("stock_info", {}).get("name", "")
         self.logger.info(f"开始商业模式分析 | {stock_code} {stock_name}")
 
-        prompt = self._build_prompt(stock_code, stock_name, cleaned)
-        model = self._get_model()
-
-        result = await self.llm.call_json(
-            prompt=prompt,
-            system_prompt=SYSTEM_PROMPT,
-            model=model,
-        )
-
-        score = result.get("model_score", 0)
+        result = self._build_result(input_data.context)
+        score = result.get("model_score")
         moat = result.get("moat_overall", "未知")
-        summary = f"商业模式评分: {score}/10, 护城河: {moat}"
-        self.logger.info(f"商业模式分析完成 | {summary}")
+        score_text = "待验证" if score is None else f"{score}/10"
+        summary = f"商业模式评分: {score_text}, 护城河: {moat}"
 
         return AgentOutput(
             agent_name=self.agent_name,
             status=AgentStatus.SUCCESS,
             data={"business_model": result},
-            data_sources=["akshare", "baostock"],
-            confidence=min(score / 10.0, 1.0),
+            data_sources=["stock_info", "financials", "announcements", "research_reports", "patents"],
+            confidence=0.78 if result.get("evidence_status") == "ok" else 0.46,
             summary=summary,
         )
 
     def validate_output(self, output: AgentOutput) -> None:
-        """校验商业模式分析输出"""
         if output.status != AgentStatus.SUCCESS:
             return
 
         bm = output.data.get("business_model", {})
-        errors = []
+        errors: list[str] = []
 
         score = bm.get("model_score")
-        if score is None or not isinstance(score, (int, float)):
-            errors.append("缺少有效的model_score")
-        elif not (0 <= score <= 10):
-            errors.append(f"model_score超出范围: {score}")
+        if score is not None and not (0 <= score <= 10):
+            errors.append(f"model_score 超出范围: {score}")
 
-        moat = bm.get("moat_overall")
-        if moat not in ("宽", "窄", "无"):
-            errors.append(f"moat_overall无效: {moat}，应为宽/窄/无")
+        if bm.get("moat_overall") not in {"宽", "窄", "无"}:
+            errors.append(f"moat_overall 无效: {bm.get('moat_overall')}")
 
-        moats = bm.get("moats", [])
-        if not isinstance(moats, list) or len(moats) < 2:
-            errors.append(f"moats不足: 需要>=3种护城河分析，至少2种，实际{len(moats) if isinstance(moats, list) else '非列表'}")
-
+        if not bm.get("profit_driver"):
+            errors.append("缺少 profit_driver")
         if not bm.get("negative_view"):
-            errors.append("缺少negative_view（反证视角）")
-
+            errors.append("缺少 negative_view")
         if not bm.get("conclusion"):
-            errors.append("缺少conclusion")
+            errors.append("缺少 conclusion")
 
         if errors:
             from investresearch.core.exceptions import AgentValidationError
+
             raise AgentValidationError(self.agent_name, errors)
 
-    # ================================================================
-    # 内部方法
-    # ================================================================
-
     def _get_model(self) -> str:
-        """获取分析层模型"""
         return self.config.get_layer_model("analysis_layer", task="business_model")
 
-    def _build_prompt(self, stock_code: str, stock_name: str, cleaned: dict) -> str:
-        """构建商业模式分析提示词"""
-        parts = [f"## 标的: {stock_code} {stock_name}\n"]
-
-        # 股票基本信息
+    def _build_result(self, context: dict[str, Any]) -> dict[str, Any]:
+        cleaned = context.get("cleaned_data", {})
         info = cleaned.get("stock_info", {})
-        if info:
-            parts.append("### 公司基本信息")
-            parts.append(f"- 行业: {info.get('industry_sw', 'N/A')}")
-            parts.append(f"- 实控人: {info.get('actual_controller', 'N/A')}")
-            mb = info.get('main_business') or 'N/A'
-            parts.append(f"- 主营业务: {mb[:300]}")
-            parts.append("")
+        financials = [item for item in cleaned.get("financials", []) if isinstance(item, dict)]
+        announcements = [item for item in cleaned.get("announcements", []) if isinstance(item, dict)]
+        research_reports = [item for item in cleaned.get("research_reports", []) if isinstance(item, dict)]
+        patents = [item for item in cleaned.get("patents", []) if isinstance(item, dict)]
 
-        # 财务数据（收入结构分析用）
-        financials = cleaned.get("financials", [])
-        if financials:
-            parts.append("### 多期财务数据")
-            parts.append("| 报告期 | 营收 | 净利润 | 毛利率 | 净利率 | ROE | 经营现金流 |")
-            parts.append("|---|---|---|---|---|---|---|")
-            for f in financials[:5]:
-                if not isinstance(f, dict):
-                    continue
-                parts.append(
-                    f"| {f.get('report_date', 'N/A')} "
-                    f"| {self._fmt(f.get('revenue'))} "
-                    f"| {self._fmt(f.get('net_profit'))} "
-                    f"| {self._fmt_pct(f.get('gross_margin'))} "
-                    f"| {self._fmt_pct(f.get('net_margin'))} "
-                    f"| {self._fmt_pct(f.get('roe'))} "
-                    f"| {self._fmt(f.get('operating_cashflow'))} |"
-                )
-            parts.append("")
+        stock_profile = get_module_profile(cleaned, "stock_info")
+        announcement_profile = get_module_profile(cleaned, "announcements")
+        report_profile = get_module_profile(cleaned, "research_reports")
+        patent_profile = get_module_profile(cleaned, "patents")
 
-            # 资产结构（判断轻/重资产）
-            latest = financials[0] if isinstance(financials[0], dict) else {}
-            parts.append("### 资产结构（判断轻/重资产模式）")
-            parts.append(f"- 总资产: {self._fmt(latest.get('total_assets'))}")
-            parts.append(f"- 净资产: {self._fmt(latest.get('equity'))}")
-            parts.append(f"- 资产负债率: {latest.get('debt_ratio', 'N/A')}")
-            parts.append(f"- ROE: {latest.get('roe', 'N/A')}")
-            parts.append(f"- ROIC: {latest.get('roic', 'N/A')}")
-            parts.append("")
+        latest_financial = financials[0] if financials else {}
+        main_business = str(info.get("main_business") or "主营业务待验证")
+        asset_model = str(info.get("asset_model") or self._infer_asset_model(latest_financial))
+        client_type = str(info.get("client_type") or "待验证")
 
-        # 实时行情
-        realtime = cleaned.get("realtime", {})
-        if realtime:
-            parts.append("### 当前估值")
-            parts.append(f"- 总市值: {self._fmt_cap(realtime.get('market_cap'))}")
-            parts.append(f"- PE(TTM): {realtime.get('pe_ttm', 'N/A')}")
-            parts.append("")
+        evidence_refs = merge_evidence_refs(
+            stock_profile.evidence_refs,
+            announcement_profile.evidence_refs,
+            report_profile.evidence_refs,
+            patent_profile.evidence_refs,
+        )
 
-        # 上游分析结论（如有）
-        screening = cleaned.get("screening", {})
-        if screening:
-            verdict = screening.get("verdict", "")
-            if verdict:
-                parts.append(f"### 初筛结论参考: {verdict}")
+        moats = self._infer_moats(main_business, announcements, research_reports, patents)
+        evidence_status = "ok" if (
+            stock_profile.completeness >= 0.6
+            or announcement_profile.completeness >= 0.5
+            or (stock_profile.completeness >= 0.4 and patent_profile.completeness >= 0.4)
+        ) else "partial"
 
-        financial_analysis = cleaned.get("financial_analysis", {})
-        if financial_analysis:
-            parts.append("### 财务分析参考")
-            parts.append(f"- 综合评分: {financial_analysis.get('overall_score', 'N/A')}/10")
-            conclusion = financial_analysis.get("conclusion", "")
-            if conclusion:
-                parts.append(f"- 结论: {conclusion[:200]}")
-            parts.append("")
+        moat_bonus = sum(
+            1
+            for moat in moats
+            if moat.get("strength") in {"strong", "medium"} and moat.get("moat_type") != "无"
+        )
+        model_score = None
+        if evidence_status == "ok":
+            model_score = round(min(8.8, 4.8 + moat_bonus * 0.9 + (0.5 if asset_model == "轻" else 0.2)), 1)
 
-        parts.append("请根据以上数据对该标的进行商业模式深度分析，按指定JSON格式输出。必须包含收入结构拆解、护城河验证和反证视角。")
-        return "\n".join(parts)
+        missing_fields = sorted(
+            set(stock_profile.missing_fields + announcement_profile.missing_fields + report_profile.missing_fields)
+        )
+        if patent_profile.missing_fields:
+            missing_fields.extend([f"patents.{item}" for item in patent_profile.missing_fields[:2]])
+
+        return {
+            "model_score": model_score,
+            "revenue_structure": self._build_revenue_structure(main_business, latest_financial),
+            "profit_driver": self._infer_profit_driver(latest_financial, main_business, patents),
+            "asset_model": asset_model,
+            "client_concentration": client_type,
+            "moats": moats,
+            "moat_overall": self._infer_moat_overall(moats),
+            "negative_view": self._negative_view(main_business, patents),
+            "conclusion": self._build_conclusion(evidence_status, patents, moats),
+            "evidence_status": evidence_status,
+            "missing_fields": missing_fields[:10],
+            "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
+        }
 
     @staticmethod
-    def _fmt(v: Any) -> str:
-        """格式化数值"""
-        if v is None or v == "":
-            return "N/A"
+    def _infer_asset_model(latest_financial: dict[str, Any]) -> str:
+        total_assets = latest_financial.get("total_assets")
+        revenue = latest_financial.get("revenue")
+        if total_assets in (None, "") or revenue in (None, "", 0):
+            return "混合"
         try:
-            n = float(v)
-            if abs(n) >= 1e8:
-                return f"{n/1e8:.1f}亿"
-            elif abs(n) >= 1e4:
-                return f"{n/1e4:.1f}万"
-            else:
-                return f"{n:.2f}"
-        except (ValueError, TypeError):
-            return str(v)
+            ratio = float(total_assets) / float(revenue)
+        except (ValueError, TypeError, ZeroDivisionError):
+            return "混合"
+        if ratio < 1.0:
+            return "轻"
+        if ratio > 2.0:
+            return "重"
+        return "混合"
 
     @staticmethod
-    def _fmt_pct(v: Any) -> str:
-        """格式化百分比"""
-        if v is None or v == "":
-            return "N/A"
-        try:
-            return f"{float(v):.1f}%"
-        except (ValueError, TypeError):
-            return str(v)
+    def _build_revenue_structure(main_business: str, latest_financial: dict[str, Any]) -> list[dict[str, Any]]:
+        revenue = latest_financial.get("revenue")
+        if not main_business or main_business == "主营业务待验证":
+            return []
+        return [
+            {
+                "segment_name": main_business[:32],
+                "revenue": revenue,
+                "ratio": 100.0 if revenue is not None else None,
+                "growth": latest_financial.get("revenue_yoy"),
+                "gross_margin": latest_financial.get("gross_margin"),
+            }
+        ]
 
     @staticmethod
-    def _fmt_cap(v: Any) -> str:
-        """格式化市值"""
-        if v is None:
-            return "N/A"
-        try:
-            n = float(v)
-            if n >= 1e12:
-                return f"{n/1e12:.1f}万亿"
-            elif n >= 1e8:
-                return f"{n/1e8:.1f}亿"
-            else:
-                return f"{n/1e4:.1f}万"
-        except (ValueError, TypeError):
-            return str(v)
+    def _infer_profit_driver(
+        latest_financial: dict[str, Any],
+        main_business: str,
+        patents: list[dict[str, Any]],
+    ) -> str:
+        revenue_yoy = latest_financial.get("revenue_yoy")
+        gross_margin = latest_financial.get("gross_margin")
+        operating_cashflow = latest_financial.get("operating_cashflow")
+        patent_hint = patents[0].get("title", "") if patents else ""
+        parts = [
+            f"利润驱动仍围绕主营业务[{main_business[:24]}]",
+            f"收入增速={revenue_yoy if revenue_yoy is not None else '待验证'}",
+            f"毛利率={gross_margin if gross_margin is not None else '待验证'}",
+            f"经营现金流={operating_cashflow if operating_cashflow is not None else '待验证'}",
+        ]
+        if patent_hint:
+            parts.append(f"技术侧有官方专利线索[{patent_hint[:24]}]")
+        return "；".join(parts)
+
+    @staticmethod
+    def _infer_moats(
+        main_business: str,
+        announcements: list[dict[str, Any]],
+        research_reports: list[dict[str, Any]],
+        patents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        text = " ".join(
+            [main_business]
+            + [str(item.get("excerpt") or item.get("summary") or "") for item in announcements[:3]]
+            + [str(item.get("excerpt") or item.get("summary") or "") for item in research_reports[:3]]
+            + [str(item.get("title") or item.get("summary") or "") for item in patents[:3]]
+        )
+
+        moat_specs = [
+            ("品牌", ["品牌", "渠道", "高端"]),
+            ("成本优势", ["规模", "成本", "产能", "工艺"]),
+            ("专利", ["专利", "技术", "研发", "牌照"]),
+            ("转换成本", ["粘性", "复购", "客户关系", "替换成本"]),
+        ]
+
+        moats: list[dict[str, Any]] = []
+        for moat_type, keywords in moat_specs:
+            matched = [keyword for keyword in keywords if keyword in text]
+            if not matched:
+                continue
+            moats.append(
+                {
+                    "moat_type": moat_type,
+                    "strength": "strong" if len(matched) >= 3 else "medium" if len(matched) >= 2 else "emerging",
+                    "evidence": f"命中关键词: {', '.join(matched[:3])}",
+                    "sustainability": "仍需结合年报、公告和后续跟踪继续验证。",
+                }
+            )
+
+        if patents and not any(moat.get("moat_type") == "专利" for moat in moats):
+            latest_patent = patents[0]
+            moats.append(
+                {
+                    "moat_type": "专利",
+                    "strength": "medium",
+                    "evidence": f"官方专利资料: {latest_patent.get('title', 'N/A')}",
+                    "sustainability": "需继续核验专利数量、法律状态与商业化落地情况。",
+                }
+            )
+
+        if not moats:
+            return [
+                {
+                    "moat_type": "无",
+                    "strength": "none",
+                    "evidence": "当前公开资料不足以支持明确护城河判断",
+                    "sustainability": "待验证",
+                }
+            ]
+        return moats
+
+    @staticmethod
+    def _infer_moat_overall(moats: list[dict[str, Any]]) -> str:
+        if not moats or moats[0].get("moat_type") == "无":
+            return "无"
+        strong_count = sum(1 for moat in moats if moat.get("strength") in {"strong", "medium"})
+        return "宽" if strong_count >= 2 else "窄"
+
+    @staticmethod
+    def _negative_view(main_business: str, patents: list[dict[str, Any]]) -> str:
+        patent_clause = "专利落地效果不及预期" if patents else "技术升级或替代路线冲击现有优势"
+        return (
+            f"该商业模式可能失败的路径包括：主营业务[{main_business[:20]}]景气下行、"
+            f"竞争加剧压缩毛利，以及{patent_clause}。"
+        )
+
+    @staticmethod
+    def _build_conclusion(evidence_status: str, patents: list[dict[str, Any]], moats: list[dict[str, Any]]) -> str:
+        if evidence_status != "ok":
+            if patents:
+                return "商业模式证据仍偏薄，但已补充官方专利资料，可作为技术壁垒的跟踪线索。"
+            return "商业模式证据仍偏薄，当前仅保留主营业务、资产模式和护城河方向性判断。"
+        if patents:
+            return "商业模式已有基础证据支撑，且官方专利资料为技术壁垒判断提供了增量验证。"
+        if any(item.get("moat_type") != "无" for item in moats):
+            return "商业模式已有一定原始资料支撑，但仍需年报拆分与后续公告继续验证。"
+        return "商业模式基础框架已形成，但护城河判断仍需更多一手资料补强。"

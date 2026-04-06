@@ -159,10 +159,18 @@ class ChromaKnowledgeStore:
         report_summary = report.markdown[:2000] if report.markdown else ""
         report_file_path = self._save_heavy_data(stock_code, timestamp, "report", {
             "markdown": report.markdown,
+            "chart_pack": report.chart_pack,
+            "evidence_pack": report.evidence_pack,
             "agents_completed": report.agents_completed,
             "agents_skipped": report.agents_skipped,
             "errors": report.errors,
         })
+        chart_pack_path = None
+        evidence_pack_path = None
+        if report.chart_pack:
+            chart_pack_path = self._save_heavy_data(stock_code, timestamp, "chart_pack", report.chart_pack)
+        if report.evidence_pack:
+            evidence_pack_path = self._save_heavy_data(stock_code, timestamp, "evidence_pack", report.evidence_pack)
         if report_summary:
             self._add_document(
                 KnowledgeCategory.REPORT,
@@ -178,6 +186,27 @@ class ChromaKnowledgeStore:
                 },
             )
 
+        if report.chart_pack:
+            chart_items = [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+                for item in report.chart_pack[:6]
+            ]
+            self._add_document(
+                KnowledgeCategory.REPORT,
+                doc_id=f"{doc_id}_chart_pack",
+                document=" | ".join(f"{item.get('title', 'chart')}: {item.get('summary', '')}" for item in chart_items),
+                metadata={
+                    "stock_code": stock_code,
+                    "stock_name": stock_name,
+                    "date": timestamp,
+                    "file_path": str(chart_pack_path or ""),
+                    "category": "chart_pack",
+                },
+            )
+
+        if report.evidence_pack:
+            self._index_evidence_pack(stock_code, stock_name, timestamp, report.evidence_pack)
+
         # 3. 存储研究历史记录
         history_entry = ResearchHistoryEntry(
             stock_code=stock_code,
@@ -190,6 +219,8 @@ class ChromaKnowledgeStore:
             target_price_high=conclusion.target_price_high if conclusion else None,
             current_price=conclusion.current_price if conclusion else None,
             report_path=str(report_file_path),
+            chart_pack_path=str(chart_pack_path) if chart_pack_path else None,
+            evidence_pack_path=str(evidence_pack_path) if evidence_pack_path else None,
             agents_completed=report.agents_completed,
             errors=report.errors,
         )
@@ -216,6 +247,52 @@ class ChromaKnowledgeStore:
         )
 
         logger.info(f"研究已存入知识库 | {stock_code} | id={doc_id}")
+
+    def _index_evidence_pack(
+        self,
+        stock_code: str,
+        stock_name: str,
+        timestamp: str,
+        evidence_pack: list[dict[str, Any]],
+    ) -> None:
+        """Index evidence pack summaries into the logical 6 collections."""
+        category_map = {
+            "policy": KnowledgeCategory.MACRO,
+            "industry": KnowledgeCategory.INDUSTRY,
+            "risk": KnowledgeCategory.RISK,
+            "governance": KnowledgeCategory.STOCK,
+            "valuation": KnowledgeCategory.DECISION,
+            "compliance": KnowledgeCategory.RISK,
+            "patent": KnowledgeCategory.STOCK,
+        }
+        normalized_items = [
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+            for item in evidence_pack[:12]
+        ]
+        for index, item in enumerate(normalized_items):
+            category_hint = str(item.get("category", "") or "").lower()
+            target_category = next(
+                (value for key, value in category_map.items() if key in category_hint),
+                KnowledgeCategory.STOCK,
+            )
+            document = (
+                f"{stock_code} {stock_name} | {item.get('title', 'evidence')} | "
+                f"{item.get('source', '')} | {str(item.get('excerpt', ''))[:280]}"
+            )
+            self._add_document(
+                target_category,
+                doc_id=f"{stock_code}_{timestamp}_evidence_{index}",
+                document=document,
+                metadata={
+                    "stock_code": stock_code,
+                    "stock_name": stock_name,
+                    "date": timestamp,
+                    "category": target_category.value,
+                    "source": item.get("source", ""),
+                    "title": item.get("title", ""),
+                    "reference_date": item.get("reference_date", ""),
+                },
+            )
 
     def save_analysis_result(
         self,
@@ -313,26 +390,46 @@ class ChromaKnowledgeStore:
 
         return None
 
+    def get_latest_evidence_pack(self, stock_code: str) -> list[dict[str, Any]]:
+        """Load the latest saved evidence pack for a stock."""
+        candidate_paths: list[Path] = []
+
+        latest = self.get_latest_research(stock_code)
+        if latest and latest.evidence_pack_path:
+            candidate_paths.append(Path(latest.evidence_pack_path))
+
+        candidate_paths.extend(
+            sorted(
+                self._files_dir.glob(f"{stock_code}_*_evidence_pack.json"),
+                reverse=True,
+            )
+        )
+
+        seen: set[Path] = set()
+        for path in candidate_paths:
+            resolved = Path(path)
+            if resolved in seen or not resolved.exists():
+                continue
+            seen.add(resolved)
+
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"加载证据包失败: {e}")
+                continue
+
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+
+        return []
+
     def get_monitoring_points(self, stock_code: str) -> list[str]:
         """获取跟踪指标"""
-        latest = self.get_latest_research(stock_code)
-        if latest and latest.recommendation:
-            # 尝试从结论中提取
-            collection = self._get_collection(KnowledgeCategory.DECISION)
-            try:
-                results = collection.get(
-                    where={"stock_code": stock_code},
-                    include=["documents"],
-                    limit=1,
-                )
-                if results["documents"]:
-                    doc = results["documents"][0]
-                    # 从文本中提取跟踪指标
-                    if "跟踪指标:" in doc:
-                        points_str = doc.split("跟踪指标:")[-1].strip()
-                        return [p.strip() for p in points_str.split(";") if p.strip()]
-            except Exception:
-                pass
+        conclusion = self.get_conclusion(stock_code)
+        if conclusion:
+            points = list(conclusion.monitoring_points or [])
+            if points:
+                return points
         return []
 
     def search_similar(
@@ -448,6 +545,11 @@ class ChromaKnowledgeStore:
         try:
             if isinstance(data, dict):
                 content = data
+            elif isinstance(data, list):
+                content = [
+                    item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                    for item in data
+                ]
             elif hasattr(data, "model_dump"):
                 content = data.model_dump(mode="json")
             else:

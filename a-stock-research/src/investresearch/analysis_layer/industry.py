@@ -19,6 +19,7 @@ from investresearch.core.models import (
     AgentOutput,
     AgentStatus,
 )
+from investresearch.core.trust import get_module_profile, merge_evidence_refs
 
 logger = get_logger("agent.industry")
 
@@ -105,7 +106,8 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
         """执行行业分析"""
-        cleaned = input_data.context.get("cleaned_data", {})
+        context = input_data.context
+        cleaned = context.get("cleaned_data", {})
         if not cleaned:
             return AgentOutput(
                 agent_name=self.agent_name,
@@ -117,14 +119,7 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         stock_name = input_data.stock_name or cleaned.get("stock_info", {}).get("name", "")
         self.logger.info(f"开始行业分析 | {stock_code} {stock_name}")
 
-        prompt = self._build_prompt(stock_code, stock_name, cleaned)
-        model = self._get_model()
-
-        result = await self.llm.call_json(
-            prompt=prompt,
-            system_prompt=SYSTEM_PROMPT,
-            model=model,
-        )
+        result = self._build_result(context)
 
         lifecycle = result.get("lifecycle", "未知")
         direction = result.get("prosperity_direction", "未知")
@@ -135,8 +130,8 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
             agent_name=self.agent_name,
             status=AgentStatus.SUCCESS,
             data={"industry": result},
-            data_sources=["akshare", "baostock"],
-            confidence=0.6,
+            data_sources=["industry_enhanced", "policy_documents", "research_reports"],
+            confidence=0.75 if result.get("evidence_status") == "ok" else 0.45,
             summary=summary,
         )
 
@@ -149,19 +144,25 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         errors = []
 
         lifecycle = industry.get("lifecycle")
-        if lifecycle not in ("初创期", "成长期", "成熟期", "衰退期"):
+        if lifecycle not in ("初创期", "成长期", "成熟期", "衰退期", "待验证"):
             errors.append(f"lifecycle无效: {lifecycle}")
 
         direction = industry.get("prosperity_direction")
-        if direction not in ("上行", "平稳", "下行"):
+        if direction not in ("上行", "平稳", "下行", "待验证"):
             errors.append(f"prosperity_direction无效: {direction}")
 
         competitors = industry.get("top_competitors", [])
-        if not isinstance(competitors, list) or len(competitors) < 2:
+        if (
+            industry.get("evidence_status") == "ok"
+            and (not isinstance(competitors, list) or len(competitors) < 2)
+        ):
             errors.append(f"top_competitors不足: 需要>=3个，至少2个，实际{len(competitors) if isinstance(competitors, list) else '非列表'}")
 
         indicators = industry.get("prosperity_indicators", [])
-        if not isinstance(indicators, list) or len(indicators) < 2:
+        if (
+            industry.get("evidence_status") == "ok"
+            and (not isinstance(indicators, list) or len(indicators) < 2)
+        ):
             errors.append(f"prosperity_indicators不足: 需要>=3个，至少2个")
 
         if not industry.get("lifecycle_evidence"):
@@ -181,6 +182,135 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
     def _get_model(self) -> str:
         """获取分析层模型"""
         return self.config.get_layer_model("analysis_layer", task="industry")
+
+    def _build_result(self, context: dict[str, Any]) -> dict[str, Any]:
+        cleaned = context.get("cleaned_data", {})
+        raw = context.get("raw_data", {})
+        raw_industry = raw.get("industry", {}) if isinstance(raw.get("industry", {}), dict) else {}
+        enhanced = cleaned.get("industry_enhanced", {})
+        stock_info = cleaned.get("stock_info", {})
+        policy_documents = cleaned.get("policy_documents", [])
+        research_reports = cleaned.get("research_reports", [])
+
+        profile = get_module_profile(cleaned, "industry_enhanced")
+        raw_market_size = raw_industry.get("market_size")
+        raw_growth = raw_industry.get("cagr_5y")
+        raw_cr5 = raw_industry.get("cr5")
+
+        lifecycle = raw_industry.get("lifecycle") or "待验证"
+        if hasattr(lifecycle, "value"):
+            lifecycle = lifecycle.value
+
+        competition_pattern = self._infer_competition_pattern(raw_cr5, enhanced)
+        prosperity_direction = self._infer_prosperity_direction(enhanced)
+        company_position = self._infer_company_position(enhanced, stock_info)
+        policy_stance = self._infer_policy_stance(policy_documents)
+        competitors = [
+            {
+                "name": name,
+                "market_share": None,
+                "advantage": "行业龙头/公开资料提及",
+                "threat_level": "中",
+            }
+            for name in list(enhanced.get("industry_leaders", []) or [])[:5]
+            if str(name).strip()
+        ]
+
+        evidence_refs = merge_evidence_refs(
+            profile.evidence_refs,
+            get_module_profile(cleaned, "policy_documents").evidence_refs,
+            get_module_profile(cleaned, "research_reports").evidence_refs,
+        )
+        missing_fields = list(profile.missing_fields)
+        if raw_market_size in (None, ""):
+            missing_fields.append("market_size")
+        if raw_growth in (None, ""):
+            missing_fields.append("market_growth")
+        if raw_cr5 in (None, ""):
+            missing_fields.append("cr5")
+
+        evidence_status = "ok" if raw_market_size is not None or raw_cr5 is not None or enhanced.get("data_points") else "partial"
+        conclusion = (
+            f"行业当前{prosperity_direction}，公司处于{company_position}。"
+            if evidence_status == "ok"
+            else "行业核心规模、增速或集中度数据不足，当前仅能给出方向性判断，需继续补充行业数据库。"
+        )
+
+        return {
+            "lifecycle": lifecycle if lifecycle in ("初创期", "成长期", "成熟期", "衰退期") else "待验证",
+            "lifecycle_evidence": raw_industry.get("policy_stance") or self._first_evidence_excerpt(evidence_refs) or "缺少稳定行业生命周期证据，待验证",
+            "market_size": raw_market_size,
+            "market_growth": raw_growth,
+            "competition_pattern": competition_pattern,
+            "cr5": raw_cr5,
+            "top_competitors": competitors,
+            "prosperity_indicators": list(enhanced.get("data_points", []) or [])[:5],
+            "prosperity_direction": prosperity_direction,
+            "policy_stance": policy_stance,
+            "company_position": company_position,
+            "conclusion": conclusion,
+            "evidence_status": evidence_status,
+            "missing_fields": sorted(set(missing_fields)),
+            "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
+        }
+
+    @staticmethod
+    def _infer_competition_pattern(cr5: Any, enhanced: dict[str, Any]) -> str:
+        cr5_value = None
+        try:
+            cr5_value = float(cr5)
+        except (TypeError, ValueError):
+            cr5_value = None
+        if cr5_value is not None:
+            if cr5_value >= 70:
+                return "寡头垄断"
+            if cr5_value >= 45:
+                return "寡头竞争"
+            return "垄断竞争"
+        leaders = list(enhanced.get("industry_leaders", []) or [])
+        if len(leaders) >= 3:
+            return "垄断竞争"
+        return "待验证"
+
+    @staticmethod
+    def _infer_prosperity_direction(enhanced: dict[str, Any]) -> str:
+        value = enhanced.get("industry_change_pct")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "待验证"
+        if numeric >= 1:
+            return "上行"
+        if numeric <= -1:
+            return "下行"
+        return "平稳"
+
+    @staticmethod
+    def _infer_company_position(enhanced: dict[str, Any], stock_info: dict[str, Any]) -> str:
+        rank = enhanced.get("stock_rank_in_industry")
+        total = enhanced.get("total_in_industry")
+        if rank and total:
+            return f"行业排名第 {rank}/{total}"
+        if stock_info.get("industry_sw"):
+            return f"已归属于 {stock_info.get('industry_sw')}，但行业地位仍待验证"
+        return "公司行业地位待验证"
+
+    @staticmethod
+    def _infer_policy_stance(policy_documents: list[dict[str, Any]]) -> str:
+        if not policy_documents:
+            return "政策信息不足，待验证"
+        latest = policy_documents[0]
+        title = str(latest.get("title") or "")
+        excerpt = str(latest.get("excerpt") or latest.get("summary") or "")
+        return f"存在政策原文支撑：{title}。{excerpt[:80]}"
+
+    @staticmethod
+    def _first_evidence_excerpt(evidence_refs: list[Any]) -> str:
+        for item in evidence_refs:
+            excerpt = item.excerpt if hasattr(item, "excerpt") else item.get("excerpt", "")
+            if excerpt:
+                return str(excerpt)[:120]
+        return ""
 
     def _build_prompt(self, stock_code: str, stock_name: str, cleaned: dict) -> str:
         """构建行业分析提示词"""
@@ -226,6 +356,17 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
                 )
             parts.append("")
 
+        industry_enhanced = cleaned.get("industry_enhanced", {})
+        if industry_enhanced:
+            parts.append("### 行业高频数据")
+            for item in industry_enhanced.get("data_points", [])[:6]:
+                parts.append(f"- {item}")
+            if industry_enhanced.get("industry_pe") is not None:
+                parts.append(f"- 行业PE: {industry_enhanced.get('industry_pe')}")
+            if industry_enhanced.get("industry_pb") is not None:
+                parts.append(f"- 行业PB: {industry_enhanced.get('industry_pb')}")
+            parts.append("")
+
         # 市值数据
         realtime = cleaned.get("realtime", {})
         if realtime:
@@ -237,6 +378,26 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         if financial_analysis:
             parts.append("### 财务分析参考")
             parts.append(f"- 综合评分: {financial_analysis.get('overall_score', 'N/A')}/10")
+            parts.append("")
+
+        research_reports = cleaned.get("research_reports", [])
+        if research_reports:
+            parts.append("### 行业/公司卖方资料")
+            for item in research_reports[:3]:
+                excerpt = item.get("excerpt") or item.get("summary") or ""
+                parts.append(
+                    f"- {item.get('publish_date', 'N/A')} {item.get('institution', 'N/A')}《{item.get('title', 'N/A')}》: {str(excerpt)[:180]}"
+                )
+            parts.append("")
+
+        policy_documents = cleaned.get("policy_documents", [])
+        if policy_documents:
+            parts.append("### 政策原文资料")
+            for item in policy_documents[:4]:
+                excerpt = item.get("excerpt") or item.get("summary") or ""
+                parts.append(
+                    f"- {item.get('policy_date', 'N/A')} {item.get('issuing_body', item.get('source', 'gov.cn'))}《{item.get('title', 'N/A')}》: {str(excerpt)[:220]}"
+                )
             parts.append("")
 
         parts.append("请根据以上数据对该标的所属行业进行全面分析，按指定JSON格式输出。重点关注行业生命周期、竞争格局和景气度。")
@@ -264,7 +425,10 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         if v is None or v == "":
             return "N/A"
         try:
-            return f"{float(v):.1f}%"
+            value = float(v)
+            if abs(value) <= 1.2:
+                value *= 100
+            return f"{value:.1f}%"
         except (ValueError, TypeError):
             return str(v)
 

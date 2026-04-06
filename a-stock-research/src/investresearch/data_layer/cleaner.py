@@ -32,6 +32,7 @@ from investresearch.core.models import (
     AgentStatus,
     CollectorOutput,
 )
+from investresearch.core.trust import aggregate_quality, build_module_profiles, profile_dicts
 
 logger = get_logger("agent.cleaner")
 
@@ -105,7 +106,11 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
             gov = self._clean_governance(governance_raw)
             if gov.get("_fields_available"):
                 cleaned["governance"] = gov
+                if cleaned.get("stock_info") and gov.get("actual_controller") and not cleaned["stock_info"].get("actual_controller"):
+                    cleaned["stock_info"]["actual_controller"] = gov["actual_controller"]
                 self.logger.info(f"治理数据清洗完成: {', '.join(gov['_fields_available'])}")
+                if gov.get("_completeness", 0) < 0.4:
+                    warnings.append("治理数据证据不足，仅可支持有限判断")
             else:
                 warnings.append("治理数据为空壳")
         else:
@@ -172,15 +177,46 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         else:
             warnings.append("无舆情数据")
 
+        policy_raw = raw.get("policy_documents", [])
+        if policy_raw:
+            cleaned["policy_documents"] = self._clean_policy_documents(policy_raw)
+            self.logger.info(f"政策原文清洗完成: {len(cleaned['policy_documents'])} 条")
+        else:
+            warnings.append("无政策原文")
+
         # === 完整性检查 ===
-        coverage = self._calc_cleaned_coverage(cleaned)
+        compliance_raw = raw.get("compliance_events", [])
+        if compliance_raw:
+            cleaned["compliance_events"] = self._clean_compliance_events(compliance_raw)
+            self.logger.info(f"官方合规事件清洗完成: {len(cleaned['compliance_events'])} 条")
+        else:
+            warnings.append("无官方合规事件数据")
+
+        patents_raw = raw.get("patents", [])
+        if patents_raw:
+            cleaned["patents"] = self._clean_patents(patents_raw)
+            self.logger.info(f"官方专利资料清洗完成: {len(cleaned['patents'])} 条")
+        else:
+            warnings.append("无官方专利资料")
+
+        profiles = build_module_profiles(cleaned)
+        status, completeness, coverage, missing_fields, evidence_refs, source_priority = aggregate_quality(profiles)
+        cleaned["module_profiles"] = profile_dicts(profiles)
+        cleaned["collection_status"] = {name: profile.status.value for name, profile in profiles.items()}
+        cleaned["status"] = status.value
+        cleaned["completeness"] = completeness
         cleaned["coverage_ratio"] = coverage
+        cleaned["missing_fields"] = missing_fields
+        cleaned["evidence_refs"] = [ref.model_dump(mode="json") for ref in evidence_refs]
+        cleaned["source_priority"] = source_priority
 
         if coverage < 0.8:
             warnings.append(f"数据覆盖率偏低({coverage:.0%})")
+        if missing_fields:
+            warnings.append(f"关键缺失字段: {', '.join(missing_fields[:6])}")
 
         self.logger.info(
-            f"清洗完成 | 覆盖率={coverage:.0%} | 警告={len(warnings)}"
+            f"清洗完成 | 状态={status.value} | 覆盖率={coverage:.0%} | 完整度={completeness:.0%} | 警告={len(warnings)}"
         )
 
         return AgentOutput(
@@ -189,7 +225,7 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
             data={"cleaned": cleaned, "warnings": warnings},
             data_sources=raw.get("data_sources", []),
             confidence=coverage,
-            summary=f"清洗完成，覆盖率{coverage:.0%}，{len(warnings)}个警告",
+            summary=f"清洗完成，状态={status.value}，覆盖率{coverage:.0%}，完整度{completeness:.0%}，{len(warnings)}个警告",
         )
 
     def validate_output(self, output: AgentOutput) -> None:
@@ -249,6 +285,10 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         cleaned = []
         for f in financials_sorted:
             item = dict(f)  # 浅拷贝
+
+            for field in ["revenue_yoy", "net_profit_yoy", "gross_margin", "net_margin", "debt_ratio", "roe", "cash_to_profit", "goodwill_ratio"]:
+                if item.get(field) is not None:
+                    item[field] = self._normalize_percent_value(item.get(field))
 
             # 计算派生指标（如果原始数据有缺失）
             if item.get("net_margin") is None:
@@ -336,32 +376,20 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
             return None
 
     @staticmethod
+    def _normalize_percent_value(v: Any) -> float | None:
+        value = DataCleanerAgent._safe_float(v)
+        if value is None:
+            return None
+        if abs(value) <= 1.2:
+            value *= 100
+        return round(value, 2)
+
+    @staticmethod
     def _calc_cleaned_coverage(cleaned: dict) -> float:
-        """计算清洗后数据覆盖率（全部13类）"""
-        checks: list[tuple[str, Any]] = [
-            ("stock_info", lambda d: bool(d.get("stock_info") and d["stock_info"].get("name"))),
-            ("prices", lambda d: bool(d.get("prices") and len(d["prices"]) > 10)),
-            ("realtime", lambda d: bool(d.get("realtime"))),
-            ("financials", lambda d: bool(d.get("financials") and len(d["financials"]) > 0)),
-            ("valuation", lambda d: bool(d.get("valuation") and len(d["valuation"]) > 0)),
-            ("announcements", lambda d: bool(d.get("announcements") and len(d["announcements"]) > 0)),
-            ("governance", lambda d: _check_governance(d)),
-            ("research_reports", lambda d: bool(d.get("research_reports") and len(d["research_reports"]) > 0)),
-            ("shareholders", lambda d: bool(d.get("shareholders"))),
-            ("industry_enhanced", lambda d: (
-                bool(d.get("industry_enhanced"))
-                and d["industry_enhanced"].get("industry_name")
-            )),
-            ("valuation_percentile", lambda d: (
-                bool(d.get("valuation_percentile"))
-                and (d["valuation_percentile"].get("pe_ttm_percentile") is not None
-                     or d["valuation_percentile"].get("pb_mrq_percentile") is not None)
-            )),
-            ("news", lambda d: bool(d.get("news") and len(d["news"]) > 0)),
-            ("sentiment", lambda d: bool(d.get("sentiment") and d.get("sentiment", {}).get("news_count_7d", 0) > 0)),
-        ]
-        filled = sum(1 for _, check in checks if check(cleaned))
-        return round(filled / len(checks), 2)
+        """计算清洗后数据覆盖率（全部14类）"""
+        profiles = build_module_profiles(cleaned)
+        _, _, coverage_ratio, _, _, _ = aggregate_quality(profiles)
+        return coverage_ratio
 
     # ================================================================
     # Sprint 1-4 清洗方法
@@ -395,6 +423,10 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
                 item["announcement_type_normalized"] = "temporary"
             else:
                 item["announcement_type_normalized"] = "other"
+            excerpt = str(item.get("excerpt", "") or "")
+            if excerpt and len(excerpt) > 600:
+                item["excerpt"] = excerpt[:600] + "..."
+            item["highlights"] = [str(point)[:120] for point in item.get("highlights", [])[:6]]
             cleaned.append(item)
 
         cleaned.sort(key=lambda x: str(x.get("announcement_date", "")), reverse=True)
@@ -408,14 +440,22 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
             fields_present.append("actual_controller")
         if cleaned.get("equity_pledge_ratio") is not None:
             fields_present.append("equity_pledge")
+        if cleaned.get("related_transaction"):
+            fields_present.append("related_transaction")
         if cleaned.get("guarantee_info"):
             fields_present.append("guarantee")
         if cleaned.get("lawsuit_info"):
             fields_present.append("lawsuit")
         if cleaned.get("management_changes"):
             fields_present.append("management_changes")
+        if cleaned.get("dividend_history"):
+            fields_present.append("dividend_history")
+        if cleaned.get("buyback_history"):
+            fields_present.append("buyback_history")
+        if cleaned.get("refinancing_history"):
+            fields_present.append("refinancing_history")
         cleaned["_fields_available"] = fields_present
-        cleaned["_completeness"] = len(fields_present) / 5.0
+        cleaned["_completeness"] = round(len(fields_present) / 8.0, 2)
         return cleaned
 
     def _clean_research_reports(self, reports: list[dict]) -> list[dict]:
@@ -444,6 +484,10 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
                 item["rating_normalized"] = "sell"
             else:
                 item["rating_normalized"] = rating.lower() if rating else "unknown"
+            excerpt = str(item.get("excerpt", "") or "")
+            if excerpt and len(excerpt) > 500:
+                item["excerpt"] = excerpt[:500] + "..."
+            item["highlights"] = [str(point)[:120] for point in item.get("highlights", [])[:6]]
             cleaned.append(item)
 
         cleaned.sort(key=lambda x: str(x.get("publish_date", "")), reverse=True)
@@ -476,15 +520,86 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         cleaned["_fields_available"] = fields_present
         return cleaned
 
+    def _clean_compliance_events(self, events: list[dict]) -> list[dict]:
+        """Normalize official compliance event records."""
+        if not events:
+            return []
+
+        cleaned: list[dict] = []
+        seen: set[str] = set()
+        for event in events:
+            item = dict(event)
+            title = str(item.get("title", "")).strip()
+            source = str(item.get("source", "")).strip()
+            if not title:
+                continue
+            dedupe_key = f"{source}:{title}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            excerpt = str(item.get("excerpt", "") or item.get("summary", "")).strip()
+            if excerpt and len(excerpt) > 500:
+                item["excerpt"] = excerpt[:500] + "..."
+            severity = str(item.get("severity", "")).lower()
+            if severity not in {"high", "medium", "low"}:
+                item["severity"] = "medium" if excerpt else "low"
+            cleaned.append(item)
+
+        cleaned.sort(key=lambda value: str(value.get("publish_date", "")), reverse=True)
+        return cleaned
+
+    def _clean_patents(self, patents: list[dict]) -> list[dict]:
+        """Normalize official patent records."""
+        if not patents:
+            return []
+
+        cleaned: list[dict] = []
+        seen: set[str] = set()
+        for patent in patents:
+            item = dict(patent)
+            title = str(item.get("title", "")).strip()
+            application_no = str(item.get("application_no", "")).strip()
+            if not title:
+                continue
+            dedupe_key = application_no or title
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            excerpt = str(item.get("excerpt", "") or item.get("summary", "")).strip()
+            if excerpt and len(excerpt) > 500:
+                item["excerpt"] = excerpt[:500] + "..."
+            keywords = item.get("keywords", [])
+            if isinstance(keywords, list):
+                item["keywords"] = [str(keyword)[:40] for keyword in keywords[:8]]
+            cleaned.append(item)
+
+        cleaned.sort(key=lambda value: str(value.get("publish_date", "")), reverse=True)
+        return cleaned
+
     def _clean_industry_enhanced(self, industry: dict) -> dict:
         """清洗行业增强数据： 验证数值字段"""
         cleaned = dict(industry)
-        for field in ["industry_index_close", "industry_change_pct", "industry_pe", "industry_pb"]:
+        for field in [
+            "industry_index_close",
+            "industry_change_pct",
+            "industry_pe",
+            "industry_pb",
+            "industry_turnover_volume",
+            "industry_turnover_amount",
+            "industry_fund_flow",
+            "industry_ytd_change_pct",
+            "industry_1y_change_pct",
+        ]:
             if field in cleaned:
                 cleaned[field] = self._safe_float(cleaned[field])
+        rising = self._safe_float(cleaned.get("rising_count"))
+        falling = self._safe_float(cleaned.get("falling_count"))
+        cleaned["rising_count"] = int(rising) if rising is not None else None
+        cleaned["falling_count"] = int(falling) if falling is not None else None
+        cleaned["data_points"] = [str(item)[:80] for item in cleaned.get("data_points", [])[:8]]
         return cleaned
 
-    def _clean_valuation_percentile_data(self, vp: dict) -> dict:
+    def _clean_valuation_percentile(self, vp: dict) -> dict:
         """清洗估值分位数据： 重新校验估值水平"""
         cleaned = dict(vp)
         pe_pct = self._safe_float(cleaned.get("pe_ttm_percentile"))
@@ -527,4 +642,33 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         total = pos + neg + neu
         if total > 0:
             cleaned["sentiment_score"] = round((pos - neg) / total, 2)
+        return cleaned
+
+    def _clean_policy_documents(self, documents: list[dict]) -> list[dict]:
+        """清洗政策原文：去重、截断摘要并按时间排序。"""
+        if not documents:
+            return []
+
+        seen_urls: set[str] = set()
+        cleaned: list[dict] = []
+        for doc in documents:
+            url = str(doc.get("url", "") or "")
+            title = str(doc.get("title", "") or "")
+            dedupe_key = url or title
+            if not dedupe_key or dedupe_key in seen_urls:
+                continue
+            seen_urls.add(dedupe_key)
+
+            item = dict(doc)
+            summary = str(item.get("summary", "") or "")
+            excerpt = str(item.get("excerpt", "") or "")
+            if summary and len(summary) > 280:
+                item["summary"] = summary[:280] + "..."
+            if excerpt and len(excerpt) > 600:
+                item["excerpt"] = excerpt[:600] + "..."
+            item["matched_keywords"] = [str(keyword)[:24] for keyword in item.get("matched_keywords", [])[:6]]
+            item["highlights"] = [str(point)[:120] for point in item.get("highlights", [])[:6]]
+            cleaned.append(item)
+
+        cleaned.sort(key=lambda x: str(x.get("policy_date", "")), reverse=True)
         return cleaned

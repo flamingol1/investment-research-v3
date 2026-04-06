@@ -3,9 +3,11 @@
 from .collector import DataCollectorAgent
 from .cleaner import DataCleanerAgent
 from .cache import FileCache
+from .official_sources import OfficialSourceRegistry
 
 __all__ = [
     "DataCollectorAgent",
     "DataCleanerAgent",
     "FileCache",
+    "OfficialSourceRegistry",
 ]

@@ -193,6 +193,18 @@ const ReportDetailPage: React.FC = () => {
       <div className="flex gap-6">
         {/* 左侧：报告正文 */}
         <div className="flex-1 min-w-0">
+          {report.errors?.length > 0 && (
+            <Card className="mb-4" style={{ background: 'rgba(245, 158, 11, 0.08)', borderColor: 'rgba(245, 158, 11, 0.3)' }}>
+              <Text strong style={{ color: '#f59e0b' }}>本次研究存在数据缺口</Text>
+              <div className="mt-2 space-y-1">
+                {report.errors.slice(0, 8).map((error, index) => (
+                  <div key={index} className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+                    {error}
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
           {report.markdown ? (
             <Card>
               <div className="markdown-content">

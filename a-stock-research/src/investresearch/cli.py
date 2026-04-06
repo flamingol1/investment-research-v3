@@ -131,7 +131,7 @@ def main() -> None:
         sys.exit(1)
 
 
-def _print_progress(step: str, message: str) -> None:
+def _print_progress(step: str, message: str, *_: object) -> None:
     """CLI进度回调"""
     print(f"  [INFO] {message}")
 
@@ -151,7 +151,7 @@ async def _run_research(stock: str, depth: str, output_dir: str) -> None:
     # 保存输出
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.now().strftime("%Y%m%d")
+    date_str = report.report_date.strftime("%Y%m%d")
 
     if report.markdown:
         report_file = out_path / f"{stock}_{date_str}.md"
@@ -159,16 +159,60 @@ async def _run_research(stock: str, depth: str, output_dir: str) -> None:
         print(f"\n  报告: {report_file}")
 
     if report.conclusion:
-        conclusion_file = out_path / f"{stock}_conclusion.json"
+        conclusion_file = out_path / f"{stock}_{date_str}_conclusion.json"
         conclusion_data = report.conclusion.model_dump(mode="json")
-        conclusion_file.write_text(
-            json.dumps(conclusion_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        serialized_conclusion = json.dumps(conclusion_data, ensure_ascii=False, indent=2)
+        conclusion_file.write_text(serialized_conclusion, encoding="utf-8")
+        (out_path / f"{stock}_conclusion.json").write_text(serialized_conclusion, encoding="utf-8")
         print(f"  结论卡片: {conclusion_file}")
+
+    if report.chart_pack:
+        chart_file = out_path / f"{stock}_{date_str}_chart_pack.json"
+        serialized_chart = json.dumps(
+            [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in report.chart_pack],
+            ensure_ascii=False,
+            indent=2,
+        )
+        chart_file.write_text(serialized_chart, encoding="utf-8")
+        (out_path / f"{stock}_chart_pack.json").write_text(serialized_chart, encoding="utf-8")
+        print(f"  图表包: {chart_file}")
+
+    if report.evidence_pack:
+        evidence_file = out_path / f"{stock}_{date_str}_evidence_pack.json"
+        serialized_evidence = json.dumps(
+            [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in report.evidence_pack],
+            ensure_ascii=False,
+            indent=2,
+        )
+        evidence_file.write_text(serialized_evidence, encoding="utf-8")
+        (out_path / f"{stock}_evidence_pack.json").write_text(serialized_evidence, encoding="utf-8")
+        print(f"  证据包: {evidence_file}")
+
+    meta_file = out_path / f"{stock}_{date_str}_meta.json"
+    meta_file.write_text(
+        json.dumps(
+            {
+                "stock_code": report.stock_code,
+                "stock_name": report.stock_name,
+                "report_date": date_str,
+                "depth": report.depth,
+                "chart_pack_count": len(report.chart_pack),
+                "evidence_pack_count": len(report.evidence_pack),
+                "agents_completed": report.agents_completed,
+                "agents_skipped": report.agents_skipped,
+                "errors": report.errors,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     _print_conclusion(report)
     _print_execution_summary(report)
+
+    if report.errors and not report.markdown and report.conclusion is None:
+        raise RuntimeError(report.errors[0])
 
 
 async def _run_update(args: argparse.Namespace) -> None:

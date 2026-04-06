@@ -1,12 +1,4 @@
-"""治理分析Agent - 管理层评估、资本配置分析
-
-分析维度:
-1. 管理层评估: 能力/诚信/稳定性
-2. 实控人分析: 股权结构/质押情况/控制力
-3. 关联交易: 占比/公允性
-4. 资本配置: 投资效率/并购历史/分红政策
-5. 激励机制: 股权激励/管理层持股
-"""
+"""Deterministic governance analysis agent."""
 
 from __future__ import annotations
 
@@ -14,81 +6,20 @@ from typing import Any
 
 from investresearch.core.agent_base import AgentBase
 from investresearch.core.logging import get_logger
-from investresearch.core.models import (
-    AgentInput,
-    AgentOutput,
-    AgentStatus,
-)
+from investresearch.core.models import AgentInput, AgentOutput, AgentStatus
+from investresearch.core.trust import get_module_profile, merge_evidence_refs
 
 logger = get_logger("agent.governance")
 
-SYSTEM_PROMPT = """你是一位专业的A股公司治理分析师，擅长管理层评估和资本配置效率分析。
-
-## 你的任务
-对给定股票进行公司治理深度分析，评估管理层质量和资本配置效率。
-
-## 分析框架
-### 1. 管理层评估
-- **能力评估**: CEO/核心管理层的行业经验、过往业绩、战略眼光
-- **诚信评估**: 是否有违规记录、承诺兑现情况、信息披露质量
-- **稳定性**: 核心管理层变动频率、任期
-- **管理层持股**: 是否与股东利益一致
-
-### 2. 实控人分析
-- 股权结构: 持股比例、控制路径
-- 质押情况: 股权质押比例（高质押=高风险）
-- 控制力: 实控人是否真正掌控公司
-- 家族企业vs职业经理人治理
-
-### 3. 关联交易
-- 关联交易占比和规模
-- 定价公允性
-- 是否存在利益输送嫌疑
-
-### 4. 资本配置效率
-- **投资效率**: ROI、资本开支vs经营现金流、增量资本回报率
-- **并购历史**: 并购频率、商誉占比、整合效果
-- **分红政策**: 分红率、分红持续性、分红融资比
-- **回购/增持**: 是否有积极回购或管理层增持
-- **再融资**: 增发/配股频率，资金使用效率
-
-### 5. 激励机制
-- 是否有股权激励计划
-- 激励条件是否合理（业绩考核指标）
-- 管理层持股比例
-
-## 输出格式（严格JSON）
-```json
-{
-  "governance_score": 7.0,
-  "management_assessment": "管理层综合评估",
-  "management_integrity": "优/良/中/差",
-  "controller_analysis": "实控人分析",
-  "related_transactions": "关联交易评估",
-  "equity_pledge": "股权质押情况",
-  "capital_allocation": "资本配置效率评估",
-  "dividend_policy": "分红政策评估",
-  "incentive_plan": "股权激励评估",
-  "conclusion": "治理综合结论"
-}
-```
-
-## 重要约束
-- governance_score范围0-10
-- management_integrity只能取"优"/"良"/"中"/"差"
-- 每个维度的评估都必须有具体依据
-- 对缺失数据需明确说明"数据不足无法判断"
-- 所有负面判断必须有证据支撑
-"""
+SYSTEM_PROMPT = "Governance analysis is implemented deterministically in this build."
 
 
 class GovernanceAgent(AgentBase[AgentInput, AgentOutput]):
-    """治理分析Agent - 管理层评估、资本配置分析"""
+    """Analyze governance quality, capital allocation, and official compliance evidence."""
 
     agent_name: str = "governance"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
-        """执行治理分析"""
         cleaned = input_data.context.get("cleaned_data", {})
         if not cleaned:
             return AgentOutput(
@@ -101,169 +32,213 @@ class GovernanceAgent(AgentBase[AgentInput, AgentOutput]):
         stock_name = input_data.stock_name or cleaned.get("stock_info", {}).get("name", "")
         self.logger.info(f"开始治理分析 | {stock_code} {stock_name}")
 
-        prompt = self._build_prompt(stock_code, stock_name, cleaned)
-        model = self._get_model()
-
-        result = await self.llm.call_json(
-            prompt=prompt,
-            system_prompt=SYSTEM_PROMPT,
-            model=model,
-        )
-
-        score = result.get("governance_score", 0)
+        result = self._build_result(input_data.context)
+        score = result.get("governance_score")
         integrity = result.get("management_integrity", "未知")
-        summary = f"治理评分: {score}/10, 管理层诚信: {integrity}"
-        self.logger.info(f"治理分析完成 | {summary}")
+        score_text = "待验证" if score is None else f"{score}/10"
+        summary = f"治理评分: {score_text}, 管理层诚信: {integrity}"
 
         return AgentOutput(
             agent_name=self.agent_name,
             status=AgentStatus.SUCCESS,
             data={"governance": result},
-            data_sources=["akshare", "baostock"],
-            confidence=min(score / 10.0, 1.0),
+            data_sources=["governance", "announcements", "shareholders", "financials", "compliance_events"],
+            confidence=0.76 if result.get("evidence_status") == "ok" else 0.45,
             summary=summary,
         )
 
     def validate_output(self, output: AgentOutput) -> None:
-        """校验治理分析输出"""
         if output.status != AgentStatus.SUCCESS:
             return
 
-        gov = output.data.get("governance", {})
-        errors = []
+        governance = output.data.get("governance", {})
+        errors: list[str] = []
 
-        score = gov.get("governance_score")
-        if score is None or not isinstance(score, (int, float)):
-            errors.append("缺少有效的governance_score")
-        elif not (0 <= score <= 10):
-            errors.append(f"governance_score超出范围: {score}")
+        score = governance.get("governance_score")
+        if score is not None and not (0 <= score <= 10):
+            errors.append(f"governance_score 超出范围: {score}")
 
-        integrity = gov.get("management_integrity")
-        if integrity not in ("优", "良", "中", "差"):
-            errors.append(f"management_integrity无效: {integrity}")
+        if governance.get("management_integrity") not in {"优", "良", "中", "差"}:
+            errors.append(f"management_integrity 无效: {governance.get('management_integrity')}")
 
-        if not gov.get("management_assessment"):
-            errors.append("缺少management_assessment")
-
-        if not gov.get("capital_allocation"):
-            errors.append("缺少capital_allocation")
-
-        if not gov.get("conclusion"):
-            errors.append("缺少conclusion")
+        for field_name in ("management_assessment", "capital_allocation", "conclusion"):
+            if not governance.get(field_name):
+                errors.append(f"缺少 {field_name}")
 
         if errors:
             from investresearch.core.exceptions import AgentValidationError
+
             raise AgentValidationError(self.agent_name, errors)
 
-    # ================================================================
-    # 内部方法
-    # ================================================================
-
     def _get_model(self) -> str:
-        """获取分析层模型"""
         return self.config.get_layer_model("analysis_layer", task="governance")
 
-    def _build_prompt(self, stock_code: str, stock_name: str, cleaned: dict) -> str:
-        """构建治理分析提示词"""
-        parts = [f"## 标的: {stock_code} {stock_name}\n"]
+    def _build_result(self, context: dict[str, Any]) -> dict[str, Any]:
+        cleaned = context.get("cleaned_data", {})
+        governance = cleaned.get("governance", {})
+        shareholders = cleaned.get("shareholders", {})
+        financials = [item for item in cleaned.get("financials", []) if isinstance(item, dict)]
+        compliance_events = [item for item in cleaned.get("compliance_events", []) if isinstance(item, dict)]
 
-        # 公司基本信息
-        info = cleaned.get("stock_info", {})
-        if info:
-            parts.append("### 公司基本信息")
-            parts.append(f"- 实控人: {info.get('actual_controller', 'N/A')}")
-            parts.append(f"- 实控人性质: {info.get('controller_type', 'N/A')}")
-            parts.append(f"- 行业: {info.get('industry_sw', 'N/A')}")
-            parts.append(f"- 上市日期: {info.get('listing_date', 'N/A')}")
-            parts.append("")
+        profile = get_module_profile(cleaned, "governance")
+        shareholder_profile = get_module_profile(cleaned, "shareholders")
+        compliance_profile = get_module_profile(cleaned, "compliance_events")
 
-        # 财务数据（资本配置效率分析用）
-        financials = cleaned.get("financials", [])
-        if financials:
-            parts.append("### 财务数据（资本配置效率分析）")
-            parts.append("| 报告期 | 营收 | 净利润 | 营收增速 | ROE | 经营现金流 | 投资现金流 | 筹资现金流 |")
-            parts.append("|---|---|---|---|---|---|---|---|")
-            for f in financials[:5]:
-                if not isinstance(f, dict):
-                    continue
-                parts.append(
-                    f"| {f.get('report_date', 'N/A')} "
-                    f"| {self._fmt(f.get('revenue'))} "
-                    f"| {self._fmt(f.get('net_profit'))} "
-                    f"| {self._fmt_pct(f.get('revenue_yoy'))} "
-                    f"| {self._fmt_pct(f.get('roe'))} "
-                    f"| {self._fmt(f.get('operating_cashflow'))} "
-                    f"| {self._fmt(f.get('investing_cashflow'))} "
-                    f"| {self._fmt(f.get('financing_cashflow'))} |"
-                )
-            parts.append("")
+        actual_controller = (
+            governance.get("actual_controller")
+            or cleaned.get("stock_info", {}).get("actual_controller")
+            or "待验证"
+        )
+        pledge_ratio = governance.get("equity_pledge_ratio")
+        related_transaction = governance.get("related_transaction") or "数据不足，无法判断"
+        management_changes = governance.get("management_changes", []) or []
+        dividend_history = governance.get("dividend_history", []) or []
+        buyback_history = governance.get("buyback_history", []) or []
+        refinancing_history = governance.get("refinancing_history", []) or []
+        latest_financial = financials[0] if financials else {}
 
-            # 资产质量指标
-            latest = financials[0] if isinstance(financials[0], dict) else {}
-            parts.append("### 资产质量指标")
-            parts.append(f"- 商誉/净资产: {latest.get('goodwill_ratio', 'N/A')}")
-            parts.append(f"- 资产负债率: {latest.get('debt_ratio', 'N/A')}")
-            parts.append(f"- ROIC: {latest.get('roic', 'N/A')}")
-            parts.append("")
+        evidence_refs = merge_evidence_refs(
+            profile.evidence_refs,
+            shareholder_profile.evidence_refs,
+            compliance_profile.evidence_refs,
+            get_module_profile(cleaned, "announcements").evidence_refs,
+        )
 
-        # 市值
-        realtime = cleaned.get("realtime", {})
-        if realtime:
-            parts.append(f"### 总市值: {self._fmt_cap(realtime.get('market_cap'))}")
-            parts.append("")
+        evidence_status = "ok" if (
+            profile.completeness >= 0.4 or shareholder_profile.completeness >= 0.4
+        ) else "insufficient"
 
-        # 上游分析参考
-        screening = cleaned.get("screening", {})
-        if screening:
-            checks = screening.get("checks", [])
-            governance_checks = [c for c in checks if "治理" in c.get("item", "")]
-            if governance_checks:
-                parts.append("### 初筛中的治理风险")
-                for c in governance_checks:
-                    parts.append(f"- {c.get('item', '')}: {c.get('status', '')} - {c.get('detail', '')}")
-                parts.append("")
+        management_integrity = self._infer_integrity(governance, compliance_events, profile.completeness)
+        governance_score = None
+        if evidence_status == "ok":
+            base_score = max(profile.completeness, shareholder_profile.completeness * 0.8)
+            if compliance_events and management_integrity == "差":
+                base_score = min(base_score, 0.35)
+            governance_score = round(base_score * 10, 1)
 
-        parts.append("请根据以上数据对该标的进行公司治理深度分析，按指定JSON格式输出。")
-        return "\n".join(parts)
+        conclusion = self._build_conclusion(evidence_status, management_integrity, compliance_events)
 
-    @staticmethod
-    def _fmt(v: Any) -> str:
-        """格式化数值"""
-        if v is None or v == "":
-            return "N/A"
-        try:
-            n = float(v)
-            if abs(n) >= 1e8:
-                return f"{n/1e8:.1f}亿"
-            elif abs(n) >= 1e4:
-                return f"{n/1e4:.1f}万"
-            else:
-                return f"{n:.2f}"
-        except (ValueError, TypeError):
-            return str(v)
+        return {
+            "governance_score": governance_score,
+            "management_assessment": self._infer_management_assessment(
+                actual_controller,
+                management_changes,
+                evidence_status,
+                compliance_events,
+            ),
+            "management_integrity": management_integrity,
+            "controller_analysis": self._infer_controller_analysis(actual_controller, pledge_ratio, shareholders),
+            "related_transactions": related_transaction,
+            "equity_pledge": (
+                f"股权质押比例约 {float(pledge_ratio):.2f}%"
+                if isinstance(pledge_ratio, (int, float))
+                else "缺少稳定股权质押证据"
+            ),
+            "capital_allocation": self._infer_capital_allocation(
+                latest_financial,
+                dividend_history,
+                buyback_history,
+                refinancing_history,
+                evidence_status,
+            ),
+            "dividend_policy": self._infer_dividend_policy(dividend_history, latest_financial, evidence_status),
+            "incentive_plan": "当前未稳定抽取股权激励公告，需结合后续公告继续跟踪。",
+            "conclusion": conclusion,
+            "evidence_status": evidence_status,
+            "missing_fields": profile.missing_fields,
+            "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
+        }
 
     @staticmethod
-    def _fmt_pct(v: Any) -> str:
-        """格式化百分比"""
-        if v is None or v == "":
-            return "N/A"
-        try:
-            return f"{float(v):.1f}%"
-        except (ValueError, TypeError):
-            return str(v)
+    def _infer_integrity(
+        governance: dict[str, Any],
+        compliance_events: list[dict[str, Any]],
+        completeness: float,
+    ) -> str:
+        if compliance_events:
+            high_risk = any(str(item.get("severity", "")).lower() == "high" for item in compliance_events)
+            if high_risk:
+                return "差"
+            return "中"
+        if governance.get("lawsuit_info"):
+            return "差"
+        if governance.get("related_transaction") or governance.get("guarantee_info"):
+            return "中"
+        if completeness >= 0.6:
+            return "良"
+        return "中"
 
     @staticmethod
-    def _fmt_cap(v: Any) -> str:
-        """格式化市值"""
-        if v is None:
-            return "N/A"
-        try:
-            n = float(v)
-            if n >= 1e12:
-                return f"{n/1e12:.1f}万亿"
-            elif n >= 1e8:
-                return f"{n/1e8:.1f}亿"
-            else:
-                return f"{n/1e4:.1f}万"
-        except (ValueError, TypeError):
-            return str(v)
+    def _infer_management_assessment(
+        actual_controller: str,
+        management_changes: list[dict[str, Any]],
+        evidence_status: str,
+        compliance_events: list[dict[str, Any]],
+    ) -> str:
+        if compliance_events:
+            latest_event = compliance_events[0]
+            return (
+                f"已检索到官方合规事件 {len(compliance_events)} 条，最近一条为"
+                f"[{latest_event.get('title', 'N/A')}]，管理层诚信与信息披露需从严跟踪。"
+            )
+        if evidence_status != "ok":
+            return f"当前仅确认实控人/股东层信息（{actual_controller}），管理层能力仍需后续公告与经营兑现验证。"
+        if management_changes:
+            return f"管理层存在 {len(management_changes)} 条变动或增减持记录，需继续观察稳定性与执行效果。"
+        return f"当前未见频繁管理层变动，可基于实控人 {actual_controller} 做基础判断。"
+
+    @staticmethod
+    def _infer_controller_analysis(actual_controller: str, pledge_ratio: Any, shareholders: dict[str, Any]) -> str:
+        top10_ratio = shareholders.get("top10_total_ratio")
+        if isinstance(pledge_ratio, (int, float)):
+            return (
+                f"实控人为 {actual_controller}；已识别股权质押比例约 {float(pledge_ratio):.2f}%；"
+                f"前十大股东合计持股 {top10_ratio or '待验证'}%。"
+            )
+        return f"实控人为 {actual_controller}；控制权结构已识别，但质押与穿透控制链仍待补充。"
+
+    @staticmethod
+    def _infer_capital_allocation(
+        latest_financial: dict[str, Any],
+        dividend_history: list[dict[str, Any]],
+        buyback_history: list[dict[str, Any]],
+        refinancing_history: list[dict[str, Any]],
+        evidence_status: str,
+    ) -> str:
+        if evidence_status != "ok":
+            return "资本配置资料不足，当前仅能跟踪自由现金流、分红、回购与再融资公告的后续补齐。"
+        parts: list[str] = []
+        if latest_financial.get("operating_cashflow") is not None:
+            parts.append(f"经营现金流={latest_financial.get('operating_cashflow')}")
+        if latest_financial.get("free_cashflow") is not None:
+            parts.append(f"自由现金流={latest_financial.get('free_cashflow')}")
+        parts.append(f"分红记录={len(dividend_history)}")
+        parts.append(f"回购记录={len(buyback_history)}")
+        parts.append(f"再融资记录={len(refinancing_history)}")
+        return "；".join(parts)
+
+    @staticmethod
+    def _infer_dividend_policy(
+        dividend_history: list[dict[str, Any]],
+        latest_financial: dict[str, Any],
+        evidence_status: str,
+    ) -> str:
+        if evidence_status != "ok":
+            return "分红政策待验证"
+        if dividend_history:
+            return f"已识别 {len(dividend_history)} 条分红记录，可继续跟踪分红率与现金流匹配度。"
+        if latest_financial.get("operating_cashflow") is not None:
+            return "存在现金流支撑，但分红公告仍需继续补齐。"
+        return "分红政策资料不足"
+
+    @staticmethod
+    def _build_conclusion(
+        evidence_status: str,
+        management_integrity: str,
+        compliance_events: list[dict[str, Any]],
+    ) -> str:
+        if compliance_events and management_integrity == "差":
+            return "官方合规事件已对治理判断形成负面证据，后续应优先跟踪监管进展与信息披露修复。"
+        if evidence_status != "ok":
+            return "治理证据仍有限，当前结论只适合做保守判断，需继续等待治理与资本配置资料补齐。"
+        return "治理结构已有基础证据支撑，但仍需结合后续公告持续验证管理层执行与资本配置效率。"

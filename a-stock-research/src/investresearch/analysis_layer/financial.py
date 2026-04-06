@@ -228,6 +228,31 @@ class FinancialAgent(AgentBase[AgentInput, AgentOutput]):
                 )
             parts.append("")
 
+        announcements = cleaned.get("announcements", [])
+        if announcements:
+            periodic = [
+                item for item in announcements
+                if item.get("announcement_type_normalized") in {"annual_report", "semi_annual", "quarterly_report"}
+            ][:4]
+            if periodic:
+                parts.append("### 定期报告原文摘录")
+                for item in periodic:
+                    excerpt = item.get("excerpt") or "；".join(item.get("highlights", [])[:2])
+                    parts.append(
+                        f"- {item.get('announcement_date', 'N/A')} {item.get('title', 'N/A')}: {str(excerpt)[:220]}"
+                    )
+                parts.append("")
+
+        research_reports = cleaned.get("research_reports", [])
+        if research_reports:
+            parts.append("### 卖方研报原文摘录")
+            for item in research_reports[:3]:
+                excerpt = item.get("excerpt") or item.get("summary") or ""
+                parts.append(
+                    f"- {item.get('publish_date', 'N/A')} {item.get('institution', 'N/A')}《{item.get('title', 'N/A')}》: {str(excerpt)[:180]}"
+                )
+            parts.append("")
+
         # 实时行情
         realtime = cleaned.get("realtime", {})
         if realtime:
@@ -267,6 +292,9 @@ class FinancialAgent(AgentBase[AgentInput, AgentOutput]):
         if v is None or v == "":
             return "N/A"
         try:
-            return f"{float(v):.1f}%"
+            value = float(v)
+            if abs(value) <= 1.2:
+                value *= 100
+            return f"{value:.1f}%"
         except (ValueError, TypeError):
             return str(v)

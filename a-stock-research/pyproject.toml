@@ -25,6 +25,9 @@ dependencies = [
     "baostock>=0.8.9",
     "pandas>=2.2.0",
     "numpy>=1.26.0",
+    "pypinyin>=0.55.0",
+    "beautifulsoup4>=4.12.0",
+    "pdfplumber>=0.11.0",
 
     # 终端美化
     "rich>=13.0.0",

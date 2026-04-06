@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from investresearch.core.agent_base import AgentBase
@@ -159,6 +159,33 @@ class DynamicTrackerAgent(AgentBase[AgentInput, AgentOutput]):
         self._check_pe(realtime, conclusion, item, thresholds, alerts)
         self._check_price_change(realtime, item, thresholds, alerts)
         self._check_risk_level(conclusion, item, thresholds, alerts)
+        self._check_target_range(realtime, conclusion, item, alerts)
+        self._check_stop_loss(realtime, conclusion, item, alerts)
+        self._check_monitoring_plan(conclusion, item, alerts)
+
+        return alerts
+
+    def _check_stock(
+        self, item: WatchListItem, global_thresholds: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Check one watch-list stock with graceful degradation on missing realtime data."""
+        alerts: list[dict[str, Any]] = []
+        thresholds = {**global_thresholds, **item.alert_thresholds}
+
+        realtime = self._get_realtime_snapshot(item.stock_code)
+        if realtime is None:
+            self.logger.warning(f"[{item.stock_code}] realtime snapshot unavailable, skip live metrics only")
+            realtime = {}
+
+        conclusion = self.store.get_conclusion(item.stock_code)
+
+        self._check_pe(realtime, conclusion, item, thresholds, alerts)
+        self._check_price_change(realtime, item, thresholds, alerts)
+        self._check_risk_level(conclusion, item, thresholds, alerts)
+        self._check_recent_official_evidence(item, alerts)
+        self._check_target_range(realtime, conclusion, item, alerts)
+        self._check_stop_loss(realtime, conclusion, item, alerts)
+        self._check_monitoring_plan(conclusion, item, alerts)
 
         return alerts
 
@@ -233,9 +260,155 @@ class DynamicTrackerAgent(AgentBase[AgentInput, AgentOutput]):
                 f"投资建议已变为: {conclusion.recommendation}",
             ))
 
+    def _check_target_range(
+        self,
+        realtime: dict[str, Any],
+        conclusion: InvestmentConclusion | None,
+        item: WatchListItem,
+        alerts: list[dict[str, Any]],
+    ) -> None:
+        """检查价格是否偏离目标区间。"""
+        if not conclusion:
+            return
+        price = realtime.get("price")
+        if price is None:
+            return
+        if conclusion.target_price_high is not None and price > conclusion.target_price_high:
+            alerts.append(self._make_alert(
+                item, "threshold", "warning",
+                "target_price_high", f"{price:.2f}", f"{conclusion.target_price_high:.2f}",
+                "当前价格已超过目标价上限，需复核收益兑现与估值空间。",
+            ))
+        if conclusion.target_price_low is not None and price < conclusion.target_price_low * 0.9:
+            alerts.append(self._make_alert(
+                item, "threshold", "warning",
+                "target_price_low", f"{price:.2f}", f"{conclusion.target_price_low:.2f}",
+                "当前价格显著低于目标区间下限，需重新检查基本面或市场风险。",
+            ))
+
+    def _check_stop_loss(
+        self,
+        realtime: dict[str, Any],
+        conclusion: InvestmentConclusion | None,
+        item: WatchListItem,
+        alerts: list[dict[str, Any]],
+    ) -> None:
+        """检查是否触发止损。"""
+        if not conclusion or conclusion.stop_loss_price is None:
+            return
+        price = realtime.get("price")
+        if price is None:
+            return
+        if price <= conclusion.stop_loss_price:
+            alerts.append(self._make_alert(
+                item, "event", "critical",
+                "stop_loss", f"{price:.2f}", f"{conclusion.stop_loss_price:.2f}",
+                "已触发止损线，应优先复核投资逻辑失效条件。",
+            ))
+
+    def _check_monitoring_plan(
+        self,
+        conclusion: InvestmentConclusion | None,
+        item: WatchListItem,
+        alerts: list[dict[str, Any]],
+    ) -> None:
+        """将分层监控计划透传为跟踪提示。"""
+        if not conclusion or not conclusion.monitoring_plan:
+            return
+        for plan_item in conclusion.monitoring_plan[:3]:
+            metric = plan_item.metric if hasattr(plan_item, "metric") else plan_item.get("metric", "")
+            layer = plan_item.layer if hasattr(plan_item, "layer") else plan_item.get("layer", "")
+            layer_value = getattr(layer, "value", layer)
+            trigger = plan_item.trigger if hasattr(plan_item, "trigger") else plan_item.get("trigger", "")
+            if not metric:
+                continue
+            severity = "info"
+            if str(layer_value) == "risk_trigger":
+                severity = "warning"
+            alerts.append(self._make_alert(
+                item, "event", severity,
+                f"monitor_{layer_value}", metric, trigger or None,
+                f"[{layer_value}] {metric} | 触发条件: {trigger or '出现显著偏离即重算'}",
+            ))
+
     # ================================================================
     # 工具方法
     # ================================================================
+
+    def _check_recent_official_evidence(
+        self,
+        item: WatchListItem,
+        alerts: list[dict[str, Any]],
+    ) -> None:
+        """Raise a risk alert when recent official compliance evidence exists."""
+        evidence_pack = self.store.get_latest_evidence_pack(item.stock_code)
+        if not evidence_pack:
+            return
+
+        cutoff = datetime.now() - timedelta(days=45)
+        latest_event: dict[str, Any] | None = None
+        latest_ts: datetime | None = None
+
+        for payload in evidence_pack:
+            if not isinstance(payload, dict):
+                continue
+            category = str(payload.get("category") or "").lower()
+            if "compliance" not in category:
+                continue
+
+            parsed_dt = self._parse_reference_datetime(payload.get("reference_date"))
+            if parsed_dt and parsed_dt < cutoff:
+                continue
+
+            if latest_ts is None or (parsed_dt and parsed_dt > latest_ts):
+                latest_event = payload
+                latest_ts = parsed_dt
+
+        if not latest_event:
+            return
+
+        text = f"{latest_event.get('title', '')} {latest_event.get('excerpt', '')}"
+        severity = "warning"
+        if any(token in text for token in ("处罚", "立案", "失信", "执行", "违规", "虚假")):
+            severity = "critical"
+
+        message = (
+            f"Recent official compliance evidence detected: {latest_event.get('title', 'N/A')} | "
+            f"source={latest_event.get('source', 'N/A')}"
+        )
+        if latest_event.get("reference_date"):
+            message += f" | date={latest_event.get('reference_date')}"
+
+        alerts.append(
+            self._make_alert(
+                item,
+                "event",
+                severity,
+                "official_compliance",
+                str(latest_event.get("title", "N/A")),
+                str(latest_event.get("reference_date") or ""),
+                message,
+            )
+        )
+
+    @staticmethod
+    def _parse_reference_datetime(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        normalized = text.replace("Z", "+00:00")
+        for candidate in (normalized, normalized[:19], normalized[:10]):
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        return None
 
     def _get_realtime_snapshot(self, stock_code: str) -> dict[str, Any] | None:
         """获取实时行情快照（复用collector逻辑）"""
