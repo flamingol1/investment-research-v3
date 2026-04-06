@@ -11,6 +11,9 @@ import ReportDetail from './pages/ReportDetail';
 import WatchListPage from './pages/WatchList';
 import History from './pages/History';
 import SearchPage from './pages/Search';
+import IntelSources from './pages/IntelSources';
+import IntelCollect from './pages/IntelCollect';
+import IntelArchives from './pages/IntelArchives';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -33,6 +36,9 @@ const App: React.FC = () => (
           <Route path="/watch" element={<WatchListPage />} />
           <Route path="/history" element={<History />} />
           <Route path="/search" element={<SearchPage />} />
+          <Route path="/intel/sources" element={<IntelSources />} />
+          <Route path="/intel/collect" element={<IntelCollect />} />
+          <Route path="/intel/archives" element={<IntelArchives />} />
         </Route>
       </Routes>
     </BrowserRouter>

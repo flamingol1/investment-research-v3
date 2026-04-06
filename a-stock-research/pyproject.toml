@@ -39,6 +39,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "websockets>=13.0",
+    "apscheduler>=3.10.4",
 ]
 
 [project.optional-dependencies]

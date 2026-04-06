@@ -294,3 +294,311 @@ export async function healthCheck(): Promise<{ status: string; version: string }
   const { data } = await api.get('/health');
   return data;
 }
+
+// ============================================================
+// 情报中心 (Intelligence Hub) API
+// ============================================================
+
+export interface IntelSource {
+  id: number;
+  name: string;
+  display_name: string;
+  description: string;
+  enabled: boolean;
+  priority: number;
+  config_json: string;
+  health_status: string;
+  last_health_check: string | null;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntelSourceUpdate {
+  display_name?: string;
+  description?: string;
+  enabled?: boolean;
+  priority?: number;
+  config_json?: Record<string, unknown>;
+}
+
+export interface IntelTask {
+  id: number;
+  name: string;
+  task_type: string;
+  target: string;
+  schedule_type: string;
+  schedule_expr: string;
+  enabled: boolean;
+  source_id: number | null;
+  status: string;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  success_count: number;
+  fail_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntelTaskCreate {
+  name: string;
+  task_type: string;
+  target: string;
+  schedule_type?: string;
+  schedule_expr?: string;
+  enabled?: boolean;
+  source_name?: string | null;
+}
+
+export interface IntelTaskUpdate {
+  name?: string;
+  task_type?: string;
+  schedule_type?: string;
+  schedule_expr?: string;
+  enabled?: boolean;
+  source_name?: string | null;
+}
+
+export interface CollectionLogItem {
+  id: number;
+  source_name: string;
+  target?: string;
+  data_type?: string;
+  status: string;
+  records_fetched: number;
+  records_stored: number;
+  error_message: string;
+  duration_ms: number;
+  started_at: string | null;
+  completed_at?: string | null;
+}
+
+export interface CollectResult {
+  data_type: string;
+  source: string;
+  status: string;
+  records_fetched: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+export interface CollectStockResponse {
+  stock_code: string;
+  results: CollectResult[];
+  success_count: number;
+  failed_count: number;
+}
+
+export interface IntelArchive {
+  id: number;
+  stock_code: string;
+  stock_name: string;
+  category: string;
+  source_name: string;
+  data_date: string | null;
+  title: string;
+  summary: string;
+  tags: string;
+  indexed: boolean;
+  created_at: string;
+}
+
+export interface IntelArchiveListResponse {
+  items: IntelArchive[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface IntelStats {
+  sources: { total: number; healthy: number };
+  archives: Record<string, unknown>;
+  data_types: number;
+}
+
+export interface KnowledgeStats {
+  archives: Record<string, unknown>;
+  vector_collections: string[];
+}
+
+// --- Data Sources ---
+
+export async function listIntelSources(): Promise<IntelSource[]> {
+  const { data } = await api.get('/intel/sources');
+  return data;
+}
+
+export async function getIntelSource(name: string): Promise<IntelSource> {
+  const { data } = await api.get(`/intel/sources/${name}`);
+  return data;
+}
+
+export async function updateIntelSource(name: string, update: IntelSourceUpdate): Promise<IntelSource> {
+  const { data } = await api.put(`/intel/sources/${name}`, update);
+  return data;
+}
+
+export async function deleteIntelSource(name: string): Promise<{ message: string }> {
+  const { data } = await api.delete(`/intel/sources/${name}`);
+  return data;
+}
+
+export async function checkSourceHealth(name: string): Promise<{ name: string; status: string; error?: string }> {
+  const { data } = await api.post(`/intel/sources/${name}/health`);
+  return data;
+}
+
+export async function checkAllHealth(): Promise<Record<string, { status: string; error?: string }>> {
+  const { data } = await api.post('/intel/sources/check-all');
+  return data;
+}
+
+// --- Collection Tasks ---
+
+export async function listIntelTasks(): Promise<IntelTask[]> {
+  const { data } = await api.get('/intel/tasks');
+  return data;
+}
+
+export async function createIntelTask(task: IntelTaskCreate): Promise<IntelTask> {
+  const { data } = await api.post('/intel/tasks', task);
+  return data;
+}
+
+export async function updateIntelTask(taskId: number, update: IntelTaskUpdate): Promise<IntelTask> {
+  const { data } = await api.put(`/intel/tasks/${taskId}`, update);
+  return data;
+}
+
+export async function deleteIntelTask(taskId: number): Promise<{ message: string }> {
+  const { data } = await api.delete(`/intel/tasks/${taskId}`);
+  return data;
+}
+
+export async function runIntelTask(taskId: number): Promise<{ task_id: number; results: CollectResult[] }> {
+  const { data } = await api.post(`/intel/tasks/${taskId}/run`);
+  return data;
+}
+
+export async function getTaskLogs(taskId: number, limit = 50): Promise<CollectionLogItem[]> {
+  const { data } = await api.get(`/intel/tasks/${taskId}/logs`, { params: { limit } });
+  return data;
+}
+
+// --- Collection Execution ---
+
+export async function collectStock(code: string, dataTypes?: string[]): Promise<CollectStockResponse> {
+  const params = dataTypes ? { data_types: dataTypes } : {};
+  const { data } = await api.post(`/intel/collect/stock/${code}`, null, { params });
+  return data;
+}
+
+export async function getCollectionLogs(target?: string, limit = 50): Promise<CollectionLogItem[]> {
+  const { data } = await api.get('/intel/logs', { params: { target, limit } });
+  return data;
+}
+
+// --- Archives ---
+
+export async function listArchives(params?: {
+  stock_code?: string;
+  category?: string;
+  keyword?: string;
+  source_name?: string;
+  page?: number;
+  page_size?: number;
+}): Promise<IntelArchiveListResponse> {
+  const { data } = await api.get('/intel/archives', { params });
+  return data;
+}
+
+export async function getArchiveContent(archiveId: number): Promise<{ id: number; content: Record<string, unknown> }> {
+  const { data } = await api.get(`/intel/archives/${archiveId}`);
+  return data;
+}
+
+export async function deleteArchive(archiveId: number): Promise<{ message: string }> {
+  const { data } = await api.delete(`/intel/archives/${archiveId}`);
+  return data;
+}
+
+export async function getArchiveStats(): Promise<Record<string, unknown>> {
+  const { data } = await api.get('/intel/archives/stats');
+  return data;
+}
+
+// --- Knowledge ---
+
+export async function getIntelStats(): Promise<IntelStats> {
+  const { data } = await api.get('/intel/stats');
+  return data;
+}
+
+export async function getDataTypes(): Promise<Record<string, { display_name: string; description: string; category: string }>> {
+  const { data } = await api.get('/intel/data-types');
+  return data;
+}
+
+export async function getKnowledgeStats(): Promise<KnowledgeStats> {
+  const { data } = await api.get('/intel/knowledge/stats');
+  return data;
+}
+
+export async function searchKnowledgeIntel(params: {
+  keyword: string;
+  stock_code?: string;
+  category?: string;
+  page?: number;
+  page_size?: number;
+}): Promise<{ items: IntelArchive[]; total: number }> {
+  const { data } = await api.get('/intel/knowledge/search', { params });
+  return data;
+}
+
+export async function rebuildKnowledge(): Promise<{ message: string; indexed_count: number; total_count: number }> {
+  const { data } = await api.post('/intel/knowledge/rebuild');
+  return data;
+}
+
+// --- Streaming Collection (SSE) ---
+
+export interface CollectStreamResponse {
+  collect_id: string;
+  stock_code: string;
+  total_steps: number;
+}
+
+export interface StepStartEvent {
+  data_type: string;
+  display_name: string;
+  step: number;
+  total: number;
+}
+
+export interface StepCompleteEvent {
+  data_type: string;
+  source: string;
+  status: string;
+  records_fetched: number;
+  duration_ms: number;
+  error: string | null;
+  step: number;
+  total: number;
+  progress: number;
+}
+
+export interface CollectDoneEvent {
+  success_count: number;
+  failed_count: number;
+}
+
+export async function collectStockStream(code: string, dataTypes?: string[]): Promise<CollectStreamResponse> {
+  const params = dataTypes ? { data_types: dataTypes } : {};
+  const { data } = await api.post(`/intel/collect/stock/${code}/stream`, null, { params, timeout: 5000 });
+  return data;
+}
+
+export async function runIntelTaskStream(taskId: number): Promise<CollectStreamResponse> {
+  const { data } = await api.post(`/intel/tasks/${taskId}/stream`, null, { timeout: 5000 });
+  return data;
+}

@@ -41,11 +41,13 @@ def create_app() -> FastAPI:
     from investresearch.api.routes.watch import router as watch_router
     from investresearch.api.routes.history import router as history_router
     from investresearch.api.routes.search import router as search_router
+    from investresearch.intel_hub.api.router import intel_router
 
     app.include_router(research_router)
     app.include_router(watch_router)
     app.include_router(history_router)
     app.include_router(search_router)
+    app.include_router(intel_router)
 
     @app.get("/api/health")
     async def health_check() -> dict:
