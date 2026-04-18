@@ -54,6 +54,43 @@ export interface ReportSummary {
   agents_completed: string[];
 }
 
+export interface ChartSeries {
+  name: string;
+  points: Array<{ x: string | number; y: number }>;
+}
+
+export interface ChartPackItem {
+  chart_id: string;
+  title: string;
+  chart_type: string;
+  unit: string;
+  summary: string;
+  series: ChartSeries[];
+}
+
+export interface EvidencePackItem {
+  category: string;
+  title: string;
+  source: string;
+  url: string;
+  excerpt: string;
+  fields: string[];
+  reference_date: string;
+}
+
+export interface QualityGateDecision {
+  blocked: boolean;
+  gate_type: string;
+  core_evidence_score: number;
+  blocking_fields: string[];
+  weak_fields: string[];
+  reasons: string[];
+  consistency_notes: string[];
+  coverage_ratio: number;
+  company_cross_confidence: number;
+  peer_verified: number;
+}
+
 export interface ReportDetail {
   stock_code: string;
   stock_name: string;
@@ -61,8 +98,11 @@ export interface ReportDetail {
   depth: string;
   markdown: string;
   conclusion: InvestmentConclusion | null;
+  chart_pack: ChartPackItem[];
+  evidence_pack: EvidencePackItem[];
   agents_completed: string[];
   agents_skipped: string[];
+  quality_gate: QualityGateDecision | null;
   errors: string[];
 }
 

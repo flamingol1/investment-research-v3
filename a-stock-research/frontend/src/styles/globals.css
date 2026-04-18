@@ -3,9 +3,35 @@
 @tailwind utilities;
 
 /* ============================================
-   CSS变量 - 暗色金融主题
+   CSS变量 - 亮色金融主题（默认）
    ============================================ */
 :root {
+  --color-bg-primary: #f1f5f9;
+  --color-bg-secondary: #ffffff;
+  --color-bg-elevated: #f8fafc;
+  --color-bg-hover: #e2e8f0;
+  --color-border: #e2e8f0;
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-brand: #2563eb;
+  --color-brand-hover: #1d4ed8;
+  --color-rise: #dc2626;
+  --color-fall: #16a34a;
+  --color-warning: #d97706;
+  --color-success: #059669;
+  --color-danger: #dc2626;
+  --color-nav-active-text: #ffffff;
+  --color-nav-inactive-text: #64748b;
+  --color-nav-hover-bg: rgba(37, 99, 235, 0.08);
+  --color-section-label: #94a3b8;
+  --color-footer-text: #94a3b8;
+  --sidebar-width: 240px;
+  --header-height: 56px;
+}
+
+/* 暗色主题覆盖 */
+:root.dark {
   --color-bg-primary: #0f1419;
   --color-bg-secondary: #1a1f2e;
   --color-bg-elevated: #242b3d;
@@ -14,29 +40,13 @@
   --color-text-primary: #e8ecf1;
   --color-text-secondary: #8899aa;
   --color-text-muted: #5c6b7f;
-  --color-brand: #3b82f6;
-  --color-brand-hover: #2563eb;
   --color-rise: #ef4444;
   --color-fall: #22c55e;
-  --color-warning: #f59e0b;
-  --color-success: #10b981;
-  --color-danger: #ef4444;
-  --sidebar-width: 240px;
-  --header-height: 56px;
-}
-
-/* 亮色主题覆盖 */
-:root.light {
-  --color-bg-primary: #f3f4f6;
-  --color-bg-secondary: #ffffff;
-  --color-bg-elevated: #f9fafb;
-  --color-bg-hover: #e5e7eb;
-  --color-border: #e5e7eb;
-  --color-text-primary: #1f2937;
-  --color-text-secondary: #4b5563;
-  --color-text-muted: #9ca3af;
-  --color-rise: #dc2626;
-  --color-fall: #16a34a;
+  --color-nav-active-text: #ffffff;
+  --color-nav-inactive-text: #8899aa;
+  --color-nav-hover-bg: rgba(255, 255, 255, 0.05);
+  --color-section-label: #5c6b7f;
+  --color-footer-text: #5c6b7f;
 }
 
 /* ============================================
@@ -66,10 +76,10 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3a4a60;
+  background: #94a3b8;
 }
 
-/* Ant Design 暗色主题覆盖 */
+/* Ant Design 主题覆盖 */
 .ant-card {
   background: var(--color-bg-secondary) !important;
   border-color: var(--color-border) !important;
@@ -97,7 +107,7 @@ body {
 .ant-input,
 .ant-select-selector,
 .ant-input-number {
-  background: var(--color-bg-elevated) !important;
+  background: var(--color-bg-secondary) !important;
   border-color: var(--color-border) !important;
   color: var(--color-text-primary) !important;
 }
@@ -161,6 +171,10 @@ body {
 }
 
 /* 进度条动画 */
+.markdown-content .report-inline-charts {
+  margin: 1.75rem 0 2rem;
+}
+
 @keyframes progress-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }

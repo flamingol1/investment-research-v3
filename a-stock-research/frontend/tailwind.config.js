@@ -18,9 +18,9 @@ export default {
         rise: '#ef4444',    // A股涨红
         fall: '#22c55e',    // A股跌绿
         surface: {
-          DEFAULT: '#1a1f2e',
-          dark: '#0f1419',
-          light: '#242b3d',
+          DEFAULT: '#ffffff',
+          dark: '#f1f5f9',
+          light: '#f8fafc',
         },
       },
       fontFamily: {

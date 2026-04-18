@@ -103,6 +103,7 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
     """行业分析Agent - 生命周期判断、竞争格局、景气度指标"""
 
     agent_name: str = "industry"
+    execution_mode: str = "hybrid"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
         """执行行业分析"""
@@ -119,7 +120,30 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         stock_name = input_data.stock_name or cleaned.get("stock_info", {}).get("name", "")
         self.logger.info(f"开始行业分析 | {stock_code} {stock_name}")
 
-        result = self._build_result(context)
+        baseline = self._build_result(context)
+        result = dict(baseline)
+        allow_live_llm = bool(context.get("_allow_live_llm"))
+        llm_invoked = False
+        model_used: str | None = None
+        runtime_mode = "deterministic"
+
+        if allow_live_llm:
+            model = self._get_model()
+            model_used = model
+            llm_invoked = True
+            try:
+                llm_result = await self.llm.call_json(
+                    prompt=self._build_prompt(stock_code, stock_name, context),
+                    system_prompt=SYSTEM_PROMPT,
+                    model=model,
+                )
+                result = self._merge_llm_result(baseline, llm_result, context)
+                runtime_mode = "llm"
+            except Exception as exc:
+                self.logger.warning(f"行业分析LLM不可用，退回规则兜底 | {exc}")
+                runtime_mode = "hybrid"
+
+        result = self._normalize_result(result, baseline, context)
 
         lifecycle = result.get("lifecycle", "未知")
         direction = result.get("prosperity_direction", "未知")
@@ -133,6 +157,9 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
             data_sources=["industry_enhanced", "policy_documents", "research_reports"],
             confidence=0.75 if result.get("evidence_status") == "ok" else 0.45,
             summary=summary,
+            execution_mode=runtime_mode,
+            llm_invoked=llm_invoked,
+            model_used=model_used if runtime_mode != "deterministic" else None,
         )
 
     def validate_output(self, output: AgentOutput) -> None:
@@ -193,9 +220,15 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         research_reports = cleaned.get("research_reports", [])
 
         profile = get_module_profile(cleaned, "industry_enhanced")
-        raw_market_size = raw_industry.get("market_size")
-        raw_growth = raw_industry.get("cagr_5y")
-        raw_cr5 = raw_industry.get("cr5")
+
+        # 交叉验证数据（同业年报多源交叉比对）
+        cross_verification = cleaned.get("cross_verification", {}) or context.get("cross_verification", {})
+        cv_metrics = self._extract_cv_metrics(cross_verification)
+
+        # 优先使用交叉验证推荐值，回退到原始数据
+        raw_market_size = cv_metrics.get("market_size") or raw_industry.get("market_size")
+        raw_growth = cv_metrics.get("cagr") or raw_industry.get("cagr_5y")
+        raw_cr5 = cv_metrics.get("cr5") or raw_industry.get("cr5")
 
         lifecycle = raw_industry.get("lifecycle") or "待验证"
         if hasattr(lifecycle, "value"):
@@ -205,16 +238,7 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         prosperity_direction = self._infer_prosperity_direction(enhanced)
         company_position = self._infer_company_position(enhanced, stock_info)
         policy_stance = self._infer_policy_stance(policy_documents)
-        competitors = [
-            {
-                "name": name,
-                "market_share": None,
-                "advantage": "行业龙头/公开资料提及",
-                "threat_level": "中",
-            }
-            for name in list(enhanced.get("industry_leaders", []) or [])[:5]
-            if str(name).strip()
-        ]
+        competitors = self._baseline_competitors(context)
 
         evidence_refs = merge_evidence_refs(
             profile.evidence_refs,
@@ -229,7 +253,16 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         if raw_cr5 in (None, ""):
             missing_fields.append("cr5")
 
-        evidence_status = "ok" if raw_market_size is not None or raw_cr5 is not None or enhanced.get("data_points") else "partial"
+        competitor_count = len([item for item in competitors if isinstance(item, dict) and str(item.get("name") or "").strip()])
+        indicator_count = len(list(enhanced.get("data_points", []) or []))
+        has_core_metrics = any(value not in (None, "") for value in (raw_market_size, raw_growth, raw_cr5))
+
+        if has_core_metrics and competitor_count >= 2 and indicator_count >= 2:
+            evidence_status = "ok"
+        elif has_core_metrics or competitor_count >= 2 or indicator_count >= 2:
+            evidence_status = "partial"
+        else:
+            evidence_status = "insufficient"
         conclusion = (
             f"行业当前{prosperity_direction}，公司处于{company_position}。"
             if evidence_status == "ok"
@@ -253,6 +286,18 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
             "missing_fields": sorted(set(missing_fields)),
             "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
         }
+
+    @staticmethod
+    def _extract_cv_metrics(cross_verification: dict[str, Any]) -> dict[str, float | None]:
+        """从交叉验证结果中提取推荐值."""
+        result: dict[str, float | None] = {}
+        for metric in cross_verification.get("verified_metrics", []):
+            name = metric.get("metric_name", "")
+            recommended = metric.get("recommended_value")
+            confidence = metric.get("confidence_score", 0)
+            if recommended is not None and confidence >= 0.4:
+                result[name] = recommended
+        return result
 
     @staticmethod
     def _infer_competition_pattern(cr5: Any, enhanced: dict[str, Any]) -> str:
@@ -312,8 +357,9 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
                 return str(excerpt)[:120]
         return ""
 
-    def _build_prompt(self, stock_code: str, stock_name: str, cleaned: dict) -> str:
+    def _build_prompt(self, stock_code: str, stock_name: str, context: dict[str, Any]) -> str:
         """构建行业分析提示词"""
+        cleaned = context.get("cleaned_data", {})
         parts = [f"## 标的: {stock_code} {stock_name}\n"]
 
         # 公司所属行业
@@ -335,6 +381,43 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
                 parts.append(f"- 5年复合增速: {industry_data['cagr_5y']}%")
             if industry_data.get("cr5"):
                 parts.append(f"- CR5集中度: {industry_data['cr5']}%")
+            parts.append("")
+
+        # 交叉验证数据（同业年报多源交叉比对）
+        cross_verification = context.get("cross_verification", {})
+        if cross_verification and cross_verification.get("verified_metrics"):
+            cv_metrics = cross_verification["verified_metrics"]
+            parts.append("### 同业交叉验证数据（多源交叉比对，可信度更高）")
+            parts.append(
+                f"- 同业公司数: {cross_verification.get('peer_count', 'N/A')}家"
+            )
+            parts.append(
+                f"- 整体置信度: {cross_verification.get('overall_confidence', 0):.0%}"
+            )
+            for metric in cv_metrics[:6]:
+                name = metric.get("metric_name", "")
+                recommended = metric.get("recommended_value")
+                confidence = metric.get("confidence_score", 0)
+                consistency = metric.get("consistency_flag", "")
+                sources = metric.get("sources", [])
+                consulting = metric.get("consulting_sources", [])
+                unit = "%" if name in ("cagr", "cr5", "market_share") else "亿元"
+                label = {
+                    "market_size": "市场规模",
+                    "cagr": "复合增速",
+                    "cr5": "CR5集中度",
+                    "market_share": "市场份额",
+                }.get(name, name)
+                if recommended is not None:
+                    parts.append(
+                        f"- {label}: {recommended}{unit} "
+                        f"(置信度={confidence:.0%}, 一致性={consistency}, "
+                        f"来源={len(sources)}家)"
+                    )
+                if consulting:
+                    parts.append(f"  - 引用咨询机构: {', '.join(consulting)}")
+                if sources:
+                    parts.append(f"  - 来源公司: {', '.join(sources[:5])}")
             parts.append("")
 
         # 财务数据（行业地位判断用）
@@ -367,6 +450,20 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
                 parts.append(f"- 行业PB: {industry_enhanced.get('industry_pb')}")
             parts.append("")
 
+        # 同业公司信息
+        cross_verification = context.get("cross_verification", {})
+        if cross_verification and cross_verification.get("peers"):
+            peers = cross_verification["peers"]
+            parts.append(f"### 同业公司（共{len(peers)}家，数据已交叉验证）")
+            for peer in peers[:6]:
+                name = peer.get("stock_name") or peer.get("stock_code", "")
+                code = peer.get("stock_code", "")
+                cap = peer.get("market_cap")
+                cap_str = self._fmt_cap(cap) if cap else "N/A"
+                rank = peer.get("rank_in_industry", "")
+                parts.append(f"- {name}({code}) 市值={cap_str} 排名={rank}")
+            parts.append("")
+
         # 市值数据
         realtime = cleaned.get("realtime", {})
         if realtime:
@@ -374,7 +471,7 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
             parts.append("")
 
         # 上游分析参考
-        financial_analysis = cleaned.get("financial_analysis", {})
+        financial_analysis = context.get("financial_analysis", {})
         if financial_analysis:
             parts.append("### 财务分析参考")
             parts.append(f"- 综合评分: {financial_analysis.get('overall_score', 'N/A')}/10")
@@ -403,6 +500,183 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         parts.append("请根据以上数据对该标的所属行业进行全面分析，按指定JSON格式输出。重点关注行业生命周期、竞争格局和景气度。")
         return "\n".join(parts)
 
+    def _merge_llm_result(
+        self,
+        baseline: dict[str, Any],
+        llm_result: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(baseline)
+        for key in (
+            "lifecycle",
+            "lifecycle_evidence",
+            "competition_pattern",
+            "prosperity_direction",
+            "policy_stance",
+            "company_position",
+            "conclusion",
+        ):
+            value = llm_result.get(key)
+            if value not in (None, "", [], {}):
+                merged[key] = value
+
+        competitors = self._normalize_competitors(llm_result.get("top_competitors"), context)
+        if competitors:
+            merged["top_competitors"] = competitors
+
+        indicators = self._normalize_text_list(llm_result.get("prosperity_indicators"), limit=5)
+        if indicators:
+            merged["prosperity_indicators"] = indicators
+
+        return merged
+
+    def _normalize_result(
+        self,
+        result: dict[str, Any],
+        baseline: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(result)
+        normalized["lifecycle"] = self._normalize_lifecycle(normalized.get("lifecycle")) or baseline.get("lifecycle", "待验证")
+        normalized["competition_pattern"] = (
+            self._normalize_competition_pattern(normalized.get("competition_pattern"))
+            or baseline.get("competition_pattern", "待验证")
+        )
+        normalized["prosperity_direction"] = (
+            self._normalize_direction(normalized.get("prosperity_direction"))
+            or baseline.get("prosperity_direction", "待验证")
+        )
+        normalized["lifecycle_evidence"] = str(
+            normalized.get("lifecycle_evidence") or baseline.get("lifecycle_evidence") or ""
+        ).strip()
+        normalized["policy_stance"] = str(normalized.get("policy_stance") or baseline.get("policy_stance") or "").strip()
+        normalized["company_position"] = str(
+            normalized.get("company_position") or baseline.get("company_position") or ""
+        ).strip()
+        normalized["conclusion"] = str(normalized.get("conclusion") or baseline.get("conclusion") or "").strip()
+        normalized["top_competitors"] = self._normalize_competitors(normalized.get("top_competitors"), context) or baseline.get("top_competitors", [])
+        normalized["prosperity_indicators"] = (
+            self._normalize_text_list(normalized.get("prosperity_indicators"), limit=5)
+            or baseline.get("prosperity_indicators", [])
+        )
+        if baseline.get("evidence_status") == "ok" and len(normalized["top_competitors"]) < 2:
+            normalized["top_competitors"] = baseline.get("top_competitors", [])
+        if baseline.get("evidence_status") == "ok" and len(normalized["prosperity_indicators"]) < 2:
+            normalized["prosperity_indicators"] = baseline.get("prosperity_indicators", [])
+        normalized["market_size"] = baseline.get("market_size")
+        normalized["market_growth"] = baseline.get("market_growth")
+        normalized["cr5"] = baseline.get("cr5")
+        normalized["evidence_status"] = baseline.get("evidence_status", "partial")
+        normalized["missing_fields"] = list(baseline.get("missing_fields", []) or [])
+        normalized["evidence_refs"] = list(baseline.get("evidence_refs", []) or [])
+        return normalized
+
+    @staticmethod
+    def _normalize_lifecycle(value: Any) -> str:
+        text = str(value or "").strip()
+        aliases = {"成长": "成长期", "成熟": "成熟期", "衰退": "衰退期", "初创": "初创期"}
+        text = aliases.get(text, text)
+        return text if text in {"初创期", "成长期", "成熟期", "衰退期", "待验证"} else ""
+
+    @staticmethod
+    def _normalize_direction(value: Any) -> str:
+        text = str(value or "").strip()
+        aliases = {"向上": "上行", "向下": "下行", "稳定": "平稳"}
+        text = aliases.get(text, text)
+        return text if text in {"上行", "平稳", "下行", "待验证"} else ""
+
+    @staticmethod
+    def _normalize_competition_pattern(value: Any) -> str:
+        text = str(value or "").strip()
+        aliases = {
+            "寡头": "寡头竞争",
+            "垄断": "寡头垄断",
+            "充分竞争": "完全竞争",
+        }
+        text = aliases.get(text, text)
+        return text if text in {"寡头垄断", "寡头竞争", "垄断竞争", "完全竞争", "待验证"} else ""
+
+    def _normalize_competitors(self, value: Any, context: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        cleaned = context.get("cleaned_data", {})
+        enhanced = cleaned.get("industry_enhanced", {})
+        cross_verification = context.get("cross_verification", {})
+        allowed_names = {
+            str(name).strip()
+            for name in list(enhanced.get("industry_leaders", []) or [])
+            if str(name).strip()
+        }
+        for item in cross_verification.get("peers", []) or []:
+            name = str(item.get("stock_name") or item.get("stock_code") or "").strip()
+            if name:
+                allowed_names.add(name)
+
+        normalized: list[dict[str, Any]] = []
+        for item in value[:5]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            if allowed_names and name not in allowed_names:
+                continue
+            threat = str(item.get("threat_level") or "中").strip()
+            threat = {"高风险": "高", "中风险": "中", "低风险": "低"}.get(threat, threat)
+            if threat not in {"高", "中", "低"}:
+                threat = "中"
+            normalized.append(
+                {
+                    "name": name,
+                    "market_share": item.get("market_share"),
+                    "advantage": str(item.get("advantage") or "公开资料提及").strip(),
+                    "threat_level": threat,
+                }
+            )
+        return normalized
+
+    def _baseline_competitors(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        cleaned = context.get("cleaned_data", {})
+        enhanced = cleaned.get("industry_enhanced", {})
+        cross_verification = cleaned.get("cross_verification", {}) or context.get("cross_verification", {})
+
+        candidates: list[str] = []
+        for name in list(enhanced.get("industry_leaders", []) or []):
+            text = str(name).strip()
+            if text and text not in candidates:
+                candidates.append(text)
+
+        for peer in cross_verification.get("peers", []) or []:
+            if not isinstance(peer, dict):
+                continue
+            text = str(peer.get("stock_name") or peer.get("stock_code") or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+
+        return [
+            {
+                "name": name,
+                "market_share": None,
+                "advantage": "同业样本/公开资料提及",
+                "threat_level": "中",
+            }
+            for name in candidates[:5]
+        ]
+
+    @staticmethod
+    def _normalize_text_list(value: Any, limit: int = 5) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if not text or text in result:
+                continue
+            result.append(text)
+            if len(result) >= limit:
+                break
+        return result
+
     @staticmethod
     def _fmt(v: Any) -> str:
         """格式化数值"""
@@ -425,10 +699,7 @@ class IndustryAgent(AgentBase[AgentInput, AgentOutput]):
         if v is None or v == "":
             return "N/A"
         try:
-            value = float(v)
-            if abs(value) <= 1.2:
-                value *= 100
-            return f"{value:.1f}%"
+            return f"{float(v):.1f}%"
         except (ValueError, TypeError):
             return str(v)
 

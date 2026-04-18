@@ -24,11 +24,20 @@ from investresearch.core.models import (
     InvestmentConclusion,
     ResearchReport,
 )
+from investresearch.core.trust import (
+    build_field_quality_map,
+    build_quality_gate_decision,
+    build_regression_baseline_snapshot,
+    field_quality_dicts,
+)
 from investresearch.data_layer.cache import FileCache
 from investresearch.data_layer.cleaner import DataCleanerAgent
 from investresearch.data_layer.collector import DataCollectorAgent
+from investresearch.data_layer.cross_verify import CrossVerificationEngine
+from investresearch.data_layer.industry_peers import PeerIdentifier, PeerReportCollector
 
 from .conclusion import ConclusionAgent
+from .deep_research_review import DeepResearchReviewAgent
 from .report import ReportAgent
 
 try:
@@ -57,6 +66,7 @@ AGENT_LABELS: dict[str, str] = {
     "init": "初始化",
     "data_collector": "数据采集",
     "data_cleaner": "数据清洗",
+    "quality_gate": "证据闸门",
     "screener": "初筛检查",
     "analysis": "并行分析",
     "financial": "财务分析",
@@ -65,6 +75,7 @@ AGENT_LABELS: dict[str, str] = {
     "governance": "治理分析",
     "valuation": "估值分析",
     "risk": "风险分析",
+    "deep_review": "深度复核",
     "report": "报告生成",
     "conclusion": "投资结论",
     "knowledge_base": "知识库归档",
@@ -240,6 +251,32 @@ class ResearchCoordinator:
             "current_agent": "analysis",
         }
 
+    @staticmethod
+    def _record_execution(
+        context: dict[str, Any],
+        agent: Any,
+        output: AgentOutput,
+    ) -> None:
+        if hasattr(agent, "build_execution_record"):
+            record = agent.build_execution_record(output).model_dump(mode="json")
+        else:
+            record = {
+                "agent_name": output.agent_name,
+                "status": output.status.value,
+                "execution_mode": output.execution_mode,
+                "configured_model": output.configured_model,
+                "model_used": output.model_used,
+                "llm_invoked": output.llm_invoked,
+                "summary": output.summary,
+                "confidence": output.confidence,
+                "errors": list(output.errors),
+            }
+
+        trace = context.setdefault("execution_trace", [])
+        trace[:] = [item for item in trace if item.get("agent_name") != output.agent_name]
+        trace.append(record)
+        context.setdefault("agent_execution", {})[output.agent_name] = record
+
     def _build_conclusion_detail(
         self,
         conclusion: InvestmentConclusion,
@@ -297,7 +334,11 @@ class ResearchCoordinator:
         errors: list[str] = []
         agents_completed: list[str] = []
         agents_skipped: list[str] = []
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = {
+            "execution_trace": [],
+            "agent_execution": {},
+            "stock_code": stock_code,
+        }
         stock_name = ""
 
         self._progress(
@@ -313,22 +354,27 @@ class ResearchCoordinator:
                 "current_agent": "data_collector",
             },
         )
+        collector_agent: Any | None = None
         if self._use_intel_hub:
             collector_output = await self._collect_via_intel_hub(stock_code)
         else:
             collector = DataCollectorAgent(cache=FileCache())
+            collector_agent = collector
             collector_output = await self._safe_run_agent(
                 collector,
                 AgentInput(stock_code=stock_code, depth=depth),
             )
 
         if collector_output.status == AgentStatus.SUCCESS:
+            if collector_agent is not None:
+                self._record_execution(context, collector_agent, collector_output)
             context["raw_data"] = collector_output.data
             stock_name = (
                 collector_output.data.get("stock_info", {}).get("name", "")
                 if isinstance(collector_output.data.get("stock_info"), dict)
                 else ""
             )
+            context["stock_name"] = stock_name
             agents_completed.append("data_collector")
             coverage = collector_output.data.get("coverage_ratio", 0)
             collector_errors = collector_output.errors or collector_output.data.get("errors", [])
@@ -340,6 +386,8 @@ class ResearchCoordinator:
                 stage_status="completed",
             )
         else:
+            if collector_agent is not None:
+                self._record_execution(context, collector_agent, collector_output)
             errors.append(f"数据采集失败: {collector_output.errors}")
             self._progress(
                 "data_collector",
@@ -356,6 +404,7 @@ class ResearchCoordinator:
                 stock_code=stock_code,
                 stock_name=stock_name,
                 depth=depth,
+                execution_trace=list(context.get("execution_trace", []) or []),
                 errors=errors,
                 agents_skipped=["全流程"],
             )
@@ -373,8 +422,9 @@ class ResearchCoordinator:
                 "current_agent": "data_cleaner",
             },
         )
+        cleaner_agent = DataCleanerAgent()
         cleaner_output = await self._safe_run_agent(
-            DataCleanerAgent(),
+            cleaner_agent,
             AgentInput(
                 stock_code=stock_code,
                 stock_name=stock_name,
@@ -384,9 +434,15 @@ class ResearchCoordinator:
         )
 
         if cleaner_output.status == AgentStatus.SUCCESS:
+            self._record_execution(context, cleaner_agent, cleaner_output)
             cleaned_data = cleaner_output.data.get("cleaned", {})
-            cleaned_data["collection_status"] = collector_output.data.get("collection_status", {})
-            cleaned_data["collection_errors"] = collector_output.data.get("errors", [])
+            cleaned_data["collection_status"] = {
+                **dict(collector_output.data.get("collection_status", {}) or {}),
+                **dict(cleaned_data.get("collection_status", {}) or {}),
+            }
+            cleaned_data["collection_errors"] = list(collector_output.data.get("errors", []) or [])
+            if not cleaned_data.get("field_quality"):
+                cleaned_data["field_quality"] = field_quality_dicts(build_field_quality_map(cleaned_data))
             context["cleaned_data"] = cleaned_data
             agents_completed.append("data_cleaner")
             coverage = cleaned_data.get("coverage_ratio", 0)
@@ -399,6 +455,7 @@ class ResearchCoordinator:
                 stage_status="completed",
             )
         else:
+            self._record_execution(context, cleaner_agent, cleaner_output)
             errors.append(f"数据清洗失败: {cleaner_output.errors}")
             self._progress(
                 "data_cleaner",
@@ -416,9 +473,114 @@ class ResearchCoordinator:
                 stock_code=stock_code,
                 stock_name=stock_name,
                 depth=depth,
+                execution_trace=list(context.get("execution_trace", []) or []),
                 errors=errors,
                 agents_completed=agents_completed,
                 agents_skipped=["全流程"],
+            )
+
+        # --- 行业同业批量采集 & 交叉验证 (standard/deep only) ---
+        if depth in ("standard", "deep"):
+            context["cross_verification"] = self._run_industry_peer_collection(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                cleaned_data=cleaned_data,
+                agents_completed=agents_completed,
+                agents_skipped=agents_skipped,
+                errors=errors,
+            )
+            peer_cross = context["cross_verification"]
+            self._merge_peer_cross_verification(cleaned_data, peer_cross)
+            if any(
+                peer_cross.get(key)
+                for key in ("data_points", "verified_metrics", "peers")
+            ):
+                cleaned_data["field_quality"] = field_quality_dicts(build_field_quality_map(cleaned_data))
+            context["cleaned_data"] = cleaned_data
+
+        quality_gate = self._evaluate_quality_gate(
+            cleaned_data=cleaned_data,
+            peer_cross_verification=context.get("cross_verification", {}),
+            depth=depth,
+        )
+        cleaned_data["quality_gate"] = quality_gate
+        context["quality_gate"] = quality_gate
+        if quality_gate["blocked"]:
+            gate_reasons = list(quality_gate.get("reasons", []) or [])
+            report_agent = ReportAgent()
+            chart_pack = report_agent._build_chart_pack(context)
+            evidence_pack = report_agent._build_evidence_pack(context)
+            self._extend_unique(errors, [f"研究闸门触发: {reason}" for reason in gate_reasons])
+            self._progress(
+                "quality_gate",
+                "[证据闸门] 触发，当前研究暂停输出投资结论",
+                detail={
+                    "headline": "研究闸门已触发",
+                    "note": "当前原始证据不足以支撑完整深度研究和投资结论，系统将输出待补证据报告。",
+                    "metrics": [
+                        self._metric(
+                            "core_evidence",
+                            "核心证据分",
+                            self._format_percent(quality_gate.get("core_evidence_score")),
+                            "warning",
+                        ),
+                        self._metric(
+                            "coverage",
+                            "数据覆盖率",
+                            self._format_percent(cleaned_data.get("coverage_ratio")),
+                            "warning",
+                        ),
+                        self._metric(
+                            "company_confidence",
+                            "公司多源置信度",
+                            self._format_percent((cleaned_data.get("cross_verification") or {}).get("overall_confidence")),
+                            "warning",
+                        ),
+                        self._metric(
+                            "peer_verified",
+                            "同业验证指标",
+                            len((context.get("cross_verification") or {}).get("verified_metrics", []) or []),
+                            "warning",
+                        ),
+                        self._metric(
+                            "blocking_fields",
+                            "阻断字段",
+                            len(quality_gate.get("blocking_fields", []) or []),
+                            "warning",
+                        ),
+                    ],
+                    "bullets": [str(item) for item in gate_reasons[:4]],
+                    "completed_agents": agents_completed,
+                    "current_agent": "quality_gate",
+                },
+                stage_status="failed",
+            )
+            return ResearchReport(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                depth=depth,
+                markdown=self._build_quality_gate_report(
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    cleaned_data=cleaned_data,
+                    peer_cross_verification=context.get("cross_verification", {}),
+                    quality_gate=quality_gate,
+                ),
+                quality_gate=quality_gate,
+                baseline_snapshot=build_regression_baseline_snapshot(
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    depth=depth,
+                    cleaned_data=cleaned_data,
+                    quality_gate=quality_gate,
+                    warning_count=len(errors),
+                ),
+                chart_pack=chart_pack,
+                evidence_pack=evidence_pack,
+                execution_trace=list(context.get("execution_trace", []) or []),
+                agents_completed=agents_completed,
+                agents_skipped=agents_skipped + ["screener", "分析层", "deep_review", "report", "conclusion"],
+                errors=errors,
             )
 
         self._progress(
@@ -431,8 +593,9 @@ class ResearchCoordinator:
                 "current_agent": "screener",
             },
         )
+        screener_agent = ScreenerAgent()
         screener_output = await self._safe_run_agent(
-            ScreenerAgent(),
+            screener_agent,
             AgentInput(
                 stock_code=stock_code,
                 stock_name=stock_name,
@@ -442,6 +605,7 @@ class ResearchCoordinator:
         )
 
         if screener_output.status == AgentStatus.SUCCESS:
+            self._record_execution(context, screener_agent, screener_output)
             screening_result = screener_output.data.get("screening", {})
             context["screening"] = screening_result
             agents_completed.append("screener")
@@ -472,11 +636,13 @@ class ResearchCoordinator:
                     stock_name=stock_name,
                     depth=depth,
                     markdown=self._build_early_stop_report(stock_code, stock_name, screening_result),
+                    execution_trace=list(context.get("execution_trace", []) or []),
                     agents_completed=agents_completed,
                     agents_skipped=["分析层", "报告", "结论"],
                     errors=errors,
                 )
         else:
+            self._record_execution(context, screener_agent, screener_output)
             errors.append(f"初筛失败: {screener_output.errors}")
             agents_skipped.append("screener")
             self._progress(
@@ -507,11 +673,12 @@ class ResearchCoordinator:
             detail=self._build_analysis_start_detail(active_agents, agents_completed),
         )
 
-        analysis_readonly_context = dict(context)
+        analysis_readonly_context = {**context, "_allow_live_llm": True}
 
-        async def run_analysis_agent(name: str, agent_cls: type) -> tuple[str, AgentOutput]:
+        async def run_analysis_agent(name: str, agent_cls: type) -> tuple[str, Any, AgentOutput]:
+            agent = agent_cls()
             output = await self._safe_run_agent(
-                agent_cls(),
+                agent,
                 AgentInput(
                     stock_code=stock_code,
                     stock_name=stock_name,
@@ -519,7 +686,7 @@ class ResearchCoordinator:
                     depth=depth,
                 ),
             )
-            return name, output
+            return name, agent, output
 
         tasks = [
             run_analysis_agent(name, agent_map[name])
@@ -536,7 +703,9 @@ class ResearchCoordinator:
                 errors.append(f"分析Agent异常: {result}")
                 continue
 
-            name, output = result
+            name, agent, output = result
+            self._record_execution(context, agent, output)
+            self._record_execution(analysis_context, agent, output)
             remaining_active = [agent for agent in remaining_active if agent != name]
             if output.status == AgentStatus.SUCCESS:
                 context_key = f"{name}_analysis"
@@ -569,6 +738,70 @@ class ResearchCoordinator:
                     stage_status="failed",
                 )
 
+        if depth == "deep":
+            self._progress(
+                "deep_review",
+                "[深度复核] 正在执行反方论证与假设敏感性检查...",
+                detail={
+                    "headline": "开始深度复核",
+                    "note": "会额外检查反方论点、关键假设和会改变判断的新证据。",
+                    "completed_agents": agents_completed,
+                    "current_agent": "deep_review",
+                },
+            )
+            deep_review_agent = DeepResearchReviewAgent()
+            deep_review_output = await self._safe_run_agent(
+                deep_review_agent,
+                AgentInput(
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    context={**analysis_context, "_allow_live_llm": True},
+                    depth=depth,
+                ),
+            )
+            self._record_execution(context, deep_review_agent, deep_review_output)
+            self._record_execution(analysis_context, deep_review_agent, deep_review_output)
+
+            if deep_review_output.status == AgentStatus.SUCCESS:
+                deep_review_data = deep_review_output.data.get("deep_review", {})
+                context["deep_research_review"] = deep_review_data
+                analysis_context["deep_research_review"] = deep_review_data
+                agents_completed.append("deep_review")
+                self._progress(
+                    "deep_review",
+                    f"[深度复核] {deep_review_output.summary or '已完成'}",
+                    detail={
+                        "headline": "深度复核已完成",
+                        "note": deep_review_output.summary or "已完成关键假设与反方论证复核。",
+                        "completed_agents": agents_completed,
+                        "current_agent": "deep_review",
+                    },
+                    stage_status="completed",
+                )
+            else:
+                agents_skipped.append("deep_review")
+                errors.append(f"深度复核失败: {deep_review_output.errors}")
+                self._progress(
+                    "deep_review",
+                    f"[深度复核] 失败 | {deep_review_output.errors}",
+                    detail={
+                        "headline": "深度复核失败",
+                        "note": "系统会继续生成报告和投资结论，但不会带入深度复核结果。",
+                        "bullets": [str(item) for item in deep_review_output.errors[:4]],
+                        "completed_agents": agents_completed,
+                        "current_agent": "deep_review",
+                    },
+                    stage_status="failed",
+                )
+
+        pipeline_status = {
+            "agents_completed": list(agents_completed),
+            "agents_skipped": list(agents_skipped),
+            "errors": list(errors),
+        }
+        context["pipeline_status"] = pipeline_status
+        analysis_context["pipeline_status"] = pipeline_status
+
         self._progress(
             "report",
             "[报告生成] 正在生成深度研究报告...",
@@ -580,15 +813,18 @@ class ResearchCoordinator:
                 "current_agent": "report",
             },
         )
+        report_agent = ReportAgent()
         report_output = await self._safe_run_agent(
-            ReportAgent(),
+            report_agent,
             AgentInput(
                 stock_code=stock_code,
                 stock_name=stock_name,
-                context=analysis_context,
+                context={**analysis_context, "_allow_live_llm": True},
                 depth=depth,
             ),
         )
+        self._record_execution(context, report_agent, report_output)
+        self._record_execution(analysis_context, report_agent, report_output)
 
         markdown = ""
         chart_pack: list[dict[str, Any]] = []
@@ -634,6 +870,14 @@ class ResearchCoordinator:
                 stage_status="failed",
             )
 
+        pipeline_status = {
+            "agents_completed": list(agents_completed),
+            "agents_skipped": list(agents_skipped),
+            "errors": list(errors),
+        }
+        context["pipeline_status"] = pipeline_status
+        analysis_context["pipeline_status"] = pipeline_status
+
         self._progress(
             "conclusion",
             "[投资结论] 正在生成投资结论...",
@@ -644,15 +888,18 @@ class ResearchCoordinator:
                 "current_agent": "conclusion",
             },
         )
+        conclusion_agent = ConclusionAgent()
         conclusion_output = await self._safe_run_agent(
-            ConclusionAgent(),
+            conclusion_agent,
             AgentInput(
                 stock_code=stock_code,
                 stock_name=stock_name,
-                context=analysis_context,
+                context={**analysis_context, "_allow_live_llm": True},
                 depth=depth,
             ),
         )
+        self._record_execution(context, conclusion_agent, conclusion_output)
+        self._record_execution(analysis_context, conclusion_agent, conclusion_output)
 
         conclusion: InvestmentConclusion | None = None
         if conclusion_output.status == AgentStatus.SUCCESS:
@@ -726,6 +973,19 @@ class ResearchCoordinator:
             conclusion=conclusion,
             chart_pack=chart_pack,
             evidence_pack=evidence_pack,
+            quality_gate=quality_gate,
+            baseline_snapshot=build_regression_baseline_snapshot(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                depth=depth,
+                cleaned_data=cleaned_data,
+                quality_gate=quality_gate,
+                screening=context.get("screening", {}),
+                valuation=context.get("valuation_analysis", {}),
+                conclusion=conclusion.model_dump(mode="json") if conclusion else {},
+                warning_count=len(errors),
+            ),
+            execution_trace=list(context.get("execution_trace", []) or []),
             agents_completed=agents_completed,
             agents_skipped=agents_skipped,
             errors=errors,
@@ -759,11 +1019,14 @@ class ResearchCoordinator:
             return await agent.safe_run(input_data)
         except Exception as exc:
             self.logger.error(f"Agent[{getattr(agent, 'agent_name', '?')}] 异常: {exc}")
-            return AgentOutput(
+            output = AgentOutput(
                 agent_name=getattr(agent, "agent_name", "unknown"),
                 status=AgentStatus.FAILED,
                 errors=[str(exc)],
             )
+            if hasattr(agent, "_apply_runtime_metadata"):
+                agent._apply_runtime_metadata(output)
+            return output
 
     async def _collect_via_intel_hub(self, stock_code: str) -> AgentOutput:
         """Run the optional intel-hub collector in a worker thread."""
@@ -924,3 +1187,302 @@ class ResearchCoordinator:
 
         lines.append(f"\n### 建议\n{recommendation}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _build_quality_gate_report(
+        *,
+        stock_code: str,
+        stock_name: str,
+        cleaned_data: dict[str, Any],
+        peer_cross_verification: dict[str, Any],
+        quality_gate: dict[str, Any],
+    ) -> str:
+        """Build a lightweight report when evidence quality is too weak."""
+        company_cross = cleaned_data.get("cross_verification", {}) if isinstance(cleaned_data, dict) else {}
+        missing_fields = list(cleaned_data.get("missing_fields", []) or [])
+        peer_count = int(peer_cross_verification.get("peer_count") or 0)
+        peer_verified = len(peer_cross_verification.get("verified_metrics", []) or [])
+        peer_points = len(peer_cross_verification.get("data_points", []) or [])
+        gate_reasons = list(quality_gate.get("reasons", []) or [])
+        blocking_fields = list(quality_gate.get("blocking_fields", []) or [])
+        weak_fields = list(quality_gate.get("weak_fields", []) or [])
+        consistency_notes = list(quality_gate.get("consistency_notes", []) or [])
+
+        lines = [
+            f"# {stock_code} {stock_name} 研究报告（待补证据）\n",
+            "## 研究状态\n",
+            "本次流程已完成基础采集与数据清洗，但证据质量闸门已触发，系统暂停输出深度研究结论、目标价与投资建议。\n",
+            "### 触发原因\n",
+        ]
+        for reason in gate_reasons:
+            lines.append(f"- {reason}")
+
+        lines.extend(
+            [
+                "\n## 当前证据概况\n",
+                f"- 核心证据分: {float(quality_gate.get('core_evidence_score') or 0.0):.0%}",
+                f"- 数据覆盖率: {float(cleaned_data.get('coverage_ratio') or 0.0):.0%}",
+                f"- 公司多源交叉验证置信度: {float(company_cross.get('overall_confidence') or 0.0):.0%}",
+                f"- 公司分歧指标: {', '.join(company_cross.get('divergent_metrics', [])[:6]) or '无'}",
+                f"- 同业公司数: {peer_count}",
+                f"- 同业原始数据点: {peer_points}",
+                f"- 同业验证指标: {peer_verified}",
+                f"- 阻断字段: {', '.join(blocking_fields[:8]) or '无'}",
+                f"- 弱证据字段: {', '.join(weak_fields[:8]) or '无'}",
+                f"- 关键缺失字段: {', '.join(missing_fields[:10]) or '无'}",
+            ]
+        )
+        if consistency_notes:
+            lines.extend(
+                [
+                    "\n## 证据约束说明\n",
+                    *[f"- {note}" for note in consistency_notes[:4]],
+                ]
+            )
+        lines.extend(
+            [
+                "\n## 下一步建议\n",
+                "- 优先补齐公司多源交叉验证中存在分歧的核心财务字段。",
+                "- 对阻断字段逐项补齐来源、单位、报告期与证据状态，不能用长文本结论替代结构化证据。",
+                "- 若行业同业验证未形成有效结果，应先修复同行年报提取链路，再进入行业与估值判断。",
+                "- 在覆盖率和关键证据恢复到阈值前，不应输出目标价和投资建议。",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _evaluate_quality_gate(
+        *,
+        cleaned_data: dict[str, Any],
+        peer_cross_verification: dict[str, Any],
+        depth: str,
+    ) -> dict[str, Any]:
+        """Block downstream research when evidence quality is too weak."""
+        return build_quality_gate_decision(
+            cleaned_data=cleaned_data,
+            peer_cross_verification=peer_cross_verification,
+            depth=depth,
+        ).model_dump(mode="json")
+
+    @staticmethod
+    def _merge_peer_cross_verification(
+        cleaned_data: dict[str, Any],
+        peer_cross_verification: dict[str, Any],
+    ) -> None:
+        """Backfill peer results into industry_enhanced for downstream reuse."""
+        if not isinstance(cleaned_data, dict) or not isinstance(peer_cross_verification, dict):
+            return
+
+        industry_enhanced = dict(cleaned_data.get("industry_enhanced", {}) or {})
+        peer_points = [
+            item for item in list(peer_cross_verification.get("data_points", []) or [])
+            if isinstance(item, dict)
+        ]
+        existing_points = [str(item) for item in list(industry_enhanced.get("data_points", []) or []) if str(item).strip()]
+        for item in peer_points[:12]:
+            point_text = (
+                f"{item.get('source_company', '同业')} {item.get('metric_name', 'metric')}="
+                f"{item.get('metric_value', 'N/A')}{item.get('metric_unit', '')}"
+            )
+            year = str(item.get("year") or "").strip()
+            if year:
+                point_text = f"{point_text} ({year})"
+            if point_text not in existing_points:
+                existing_points.append(point_text)
+
+        peer_names: list[str] = []
+        for item in list(peer_cross_verification.get("peers", []) or []):
+            if not isinstance(item, dict):
+                continue
+            peer_name = str(item.get("stock_name") or item.get("stock_code") or "").strip()
+            if peer_name and peer_name not in peer_names:
+                peer_names.append(peer_name)
+        if not peer_names:
+            for item in peer_points:
+                peer_name = str(item.get("source_company") or item.get("source_company_code") or "").strip()
+                if peer_name and peer_name not in peer_names:
+                    peer_names.append(peer_name)
+
+        if peer_names:
+            industry_enhanced["industry_leaders"] = peer_names[:8]
+        if existing_points:
+            industry_enhanced["data_points"] = existing_points[:12]
+
+        verified_metrics = [
+            item for item in list(peer_cross_verification.get("verified_metrics", []) or [])
+            if isinstance(item, dict)
+        ]
+        for item in verified_metrics:
+            metric_name = str(item.get("metric_name") or "").strip()
+            recommended = item.get("recommended_value")
+            if recommended in (None, "", "-"):
+                continue
+            if metric_name == "industry_pe" and industry_enhanced.get("industry_pe") in (None, "", "-"):
+                industry_enhanced["industry_pe"] = recommended
+            if metric_name == "industry_pb" and industry_enhanced.get("industry_pb") in (None, "", "-"):
+                industry_enhanced["industry_pb"] = recommended
+
+        if industry_enhanced:
+            cleaned_data["industry_enhanced"] = industry_enhanced
+
+    # ------------------------------------------------------------------
+    # 行业同业批量采集 & 交叉验证
+    # ------------------------------------------------------------------
+
+    def _run_industry_peer_collection(
+        self,
+        stock_code: str,
+        stock_name: str,
+        cleaned_data: dict[str, Any],
+        agents_completed: list[str],
+        agents_skipped: list[str],
+        errors: list[str],
+    ) -> dict[str, Any]:
+        """识别同业公司、批量采集年报、交叉验证行业数据.
+
+        非阻塞: 失败不影响主流程，仅记入 errors.
+        """
+        stock_info = cleaned_data.get("stock_info", {}) or {}
+        industry_sw = stock_info.get("industry_sw", "")
+
+        if not industry_sw:
+            self.logger.debug("缺少行业分类信息，跳过同业采集")
+            return {"status": "skipped"}
+
+        self._progress(
+            "industry_peers",
+            f"[同业采集] 正在识别 {stock_name} 的同行业公司...",
+            detail={
+                "headline": "正在识别同业公司",
+                "note": f"基于申万行业分类「{industry_sw}」查找同业公司，采集年报并交叉验证行业数据。",
+                "completed_agents": agents_completed,
+                "current_agent": "industry_peers",
+            },
+        )
+
+        try:
+            # 1. 识别同业
+            identifier = PeerIdentifier()
+            peers = identifier.identify_peers(
+                stock_code=stock_code,
+                industry_sw_name=industry_sw,
+                max_peers=8,
+                min_peers=3,
+            )
+
+            if not peers:
+                if "industry_peers" not in agents_skipped:
+                    agents_skipped.append("industry_peers")
+                self._progress(
+                    "industry_peers",
+                    "[同业采集] 未找到足够同业公司，跳过",
+                    detail={
+                        "headline": "同业采集跳过",
+                        "note": f"在申万「{industry_sw}」行业中未找到足够的同业公司。",
+                        "completed_agents": agents_completed,
+                        "current_agent": "industry_peers",
+                    },
+                )
+                return {"status": "insufficient", "peer_count": 0, "data_points": [], "verified_metrics": []}
+
+            # 2. 批量采集同业年报
+            collector = PeerReportCollector()
+
+            def _peer_progress(stage: str, msg: str) -> None:
+                self._progress("industry_peers", msg)
+
+            data_points = collector.collect_peer_reports(
+                peers=peers,
+                industry_name=industry_sw,
+                progress_callback=_peer_progress,
+            )
+
+            # 3. 交叉验证
+            engine = CrossVerificationEngine()
+            result = engine.build_result(
+                data_points=data_points,
+                peers=peers,
+                industry_name=industry_sw,
+            )
+
+            verified_count = len(result.verified_metrics)
+            result_data = result.model_dump()
+            result_data["status"] = "ok"
+            if len(data_points) == 0 or verified_count == 0:
+                error_msg = (
+                    f"同业采集未形成有效交叉验证结果: {len(peers)}家同业 / "
+                    f"{len(data_points)}个数据点 / {verified_count}个验证指标"
+                )
+                self.logger.warning(error_msg)
+                errors.append(error_msg)
+                if "industry_peers" not in agents_skipped:
+                    agents_skipped.append("industry_peers")
+                result_data["status"] = "insufficient"
+                self._progress(
+                    "industry_peers",
+                    f"[同业采集] 结果不足 | {len(peers)}家同业 | {len(data_points)}个原始数据点 | {verified_count}个交叉验证指标",
+                    detail={
+                        "headline": "同业采集结果不足",
+                        "note": "虽然识别到了同业公司，但年报提取或交叉验证没有形成可用结果，当前不应作为完整行业证据。",
+                        "metrics": [
+                            self._metric("peers", "同业公司", len(peers), "info"),
+                            self._metric("raw_points", "原始数据点", len(data_points), "warning"),
+                            self._metric("verified", "验证指标", verified_count, "warning"),
+                            self._metric("confidence", "整体置信度", f"{result.overall_confidence:.0%}", "warning"),
+                        ],
+                        "completed_agents": agents_completed,
+                        "current_agent": "industry_peers",
+                    },
+                    stage_status="failed",
+                )
+                return result_data
+
+            agents_completed.append("industry_peers")
+            self._progress(
+                "industry_peers",
+                f"[同业采集] 完成 | {len(peers)}家同业 | "
+                f"{len(data_points)}个原始数据点 | "
+                f"{verified_count}个交叉验证指标",
+                detail={
+                    "headline": "同业行业数据采集完成",
+                    "note": (
+                        f"已从 {len(peers)} 家同业公司的年报中提取行业数据，"
+                        f"交叉验证 {verified_count} 个指标。"
+                    ),
+                    "metrics": [
+                        self._metric("peers", "同业公司", len(peers), "info"),
+                        self._metric("raw_points", "原始数据点", len(data_points), "info"),
+                        self._metric("verified", "验证指标", verified_count, "success"),
+                        self._metric(
+                            "confidence",
+                            "整体置信度",
+                            f"{result.overall_confidence:.0%}",
+                            "success" if result.overall_confidence >= 0.6 else "warning",
+                        ),
+                    ],
+                    "completed_agents": agents_completed,
+                    "current_agent": "industry_peers",
+                },
+                stage_status="completed",
+            )
+
+            return result_data
+
+        except Exception as exc:
+            error_msg = f"同业采集失败（不影响主流程）: {exc}"
+            self.logger.warning(error_msg)
+            errors.append(error_msg)
+            if "industry_peers" not in agents_skipped:
+                agents_skipped.append("industry_peers")
+            self._progress(
+                "industry_peers",
+                f"[同业采集] 失败: {exc}",
+                detail={
+                    "headline": "同业采集失败",
+                    "note": "行业同业数据采集出现问题，但不影响主分析流程。",
+                    "bullets": [str(exc)[:200]],
+                    "completed_agents": agents_completed,
+                    "current_agent": "industry_peers",
+                },
+            )
+            return {"status": "failed", "error": str(exc), "data_points": [], "verified_metrics": []}

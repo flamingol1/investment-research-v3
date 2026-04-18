@@ -40,3 +40,10 @@ htmlcov/
 
 # Build output
 output/
+
+# Local temporary logs
+tmp_logs/
+tmp_logs_frontend/
+
+# Frontend build cache
+*.tsbuildinfo

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from investresearch.core.models import InvestmentConclusion
+from investresearch.core.models import InvestmentConclusion, QualityGateDecision
 
 
 class ResearchRequest(BaseModel):
@@ -133,6 +133,7 @@ class ReportDetailResponse(BaseModel):
     evidence_pack: list[dict[str, Any]] = Field(default_factory=list)
     agents_completed: list[str] = Field(default_factory=list)
     agents_skipped: list[str] = Field(default_factory=list)
+    quality_gate: QualityGateDecision | None = None
     errors: list[str] = Field(default_factory=list)
 
 

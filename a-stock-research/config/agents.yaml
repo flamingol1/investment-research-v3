@@ -4,47 +4,66 @@ data_layer:
   collector:
     timeout_minutes: 10
     model: null
+    execution_mode: "deterministic"
     batch_size: 50
   cleaner:
     timeout_minutes: 5
     model: null
+    execution_mode: "deterministic"
 
 analysis_layer:
   screener:
     timeout_minutes: 10
     model: "qwen3-plus"
+    execution_mode: "llm"
     max_stocks: 100
   industry:
     timeout_minutes: 15
     model: "qwen3-plus"
-  business:
+    execution_mode: "hybrid"
+  business_model:
     timeout_minutes: 15
     model: "qwen3-plus"
+    execution_mode: "hybrid"
     require_counter_argument: true
   governance:
     timeout_minutes: 10
     model: "qwen3-plus"
+    execution_mode: "hybrid"
   financial:
     timeout_minutes: 20
     model: "qwen3-max"
+    execution_mode: "llm"
     lookback_years: 5
   valuation:
     timeout_minutes: 15
     model: "qwen3-max"
+    execution_mode: "hybrid"
     methods: ["PE", "PB", "DCF", "PEG", "PS"]
   risk:
     timeout_minutes: 15
     model: "qwen3-plus"
+    execution_mode: "hybrid"
     scenarios: ["optimistic", "base", "pessimistic"]
 
 decision_layer:
   orchestrator:
     timeout_minutes: 60
     model: "doubao-pro"
+    execution_mode: "hybrid"
     max_retries: 2
   conclusion:
     timeout_minutes: 10
     model: "qwen3-plus"
+    execution_mode: "hybrid"
+  deep_review:
+    timeout_minutes: 10
+    model: "qwen3-plus"
+    execution_mode: "llm"
+  report:
+    timeout_minutes: 15
+    model: "qwen3-plus"
+    execution_mode: "hybrid"
 
 validation:
   require_data_source: true

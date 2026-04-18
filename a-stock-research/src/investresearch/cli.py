@@ -76,6 +76,28 @@ def main() -> None:
     search_parser.add_argument("--category", help="限制搜索分类")
     search_parser.add_argument("-n", "--num-results", type=int, default=5, help="返回结果数")
 
+    # --- 回归命令 ---
+    regression_parser = subparsers.add_parser("regression", help="运行固定回归样本篮子并保存结构化基线")
+    regression_parser.add_argument(
+        "--output-dir",
+        default="output/regression",
+        help="回归输出目录",
+    )
+    regression_parser.add_argument(
+        "--baseline-file",
+        help="历史回归结果 JSON，用于对比当前基线",
+    )
+    regression_parser.add_argument(
+        "--depth",
+        choices=["quick", "standard", "deep"],
+        help="覆盖样本默认深度；不指定则使用样本篮子自带深度",
+    )
+    regression_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="若出现基线回退或缺少 baseline_snapshot 则返回失败",
+    )
+
     # --- Web服务命令 ---
     serve_parser = subparsers.add_parser("serve", help="启动Web API服务器")
     serve_parser.add_argument("--host", default="0.0.0.0", help="监听地址")
@@ -112,6 +134,8 @@ def main() -> None:
             _run_history(args.stock)
         elif command == "search":
             _run_search(args)
+        elif command == "regression":
+            asyncio.run(_run_regression(args))
         elif command == "serve":
             _run_serve(args)
         elif args.demo and args.stock_legacy:
@@ -134,6 +158,12 @@ def main() -> None:
 def _print_progress(step: str, message: str, *_: object) -> None:
     """CLI进度回调"""
     print(f"  [INFO] {message}")
+
+
+def _unlink_if_exists(path: Path) -> None:
+    """Remove stale latest artifacts when the current run does not produce them."""
+    if path.exists():
+        path.unlink()
 
 
 # ================================================================
@@ -165,6 +195,8 @@ async def _run_research(stock: str, depth: str, output_dir: str) -> None:
         conclusion_file.write_text(serialized_conclusion, encoding="utf-8")
         (out_path / f"{stock}_conclusion.json").write_text(serialized_conclusion, encoding="utf-8")
         print(f"  结论卡片: {conclusion_file}")
+    else:
+        _unlink_if_exists(out_path / f"{stock}_conclusion.json")
 
     if report.chart_pack:
         chart_file = out_path / f"{stock}_{date_str}_chart_pack.json"
@@ -176,6 +208,8 @@ async def _run_research(stock: str, depth: str, output_dir: str) -> None:
         chart_file.write_text(serialized_chart, encoding="utf-8")
         (out_path / f"{stock}_chart_pack.json").write_text(serialized_chart, encoding="utf-8")
         print(f"  图表包: {chart_file}")
+    else:
+        _unlink_if_exists(out_path / f"{stock}_chart_pack.json")
 
     if report.evidence_pack:
         evidence_file = out_path / f"{stock}_{date_str}_evidence_pack.json"
@@ -187,26 +221,29 @@ async def _run_research(stock: str, depth: str, output_dir: str) -> None:
         evidence_file.write_text(serialized_evidence, encoding="utf-8")
         (out_path / f"{stock}_evidence_pack.json").write_text(serialized_evidence, encoding="utf-8")
         print(f"  证据包: {evidence_file}")
+    else:
+        _unlink_if_exists(out_path / f"{stock}_evidence_pack.json")
 
-    meta_file = out_path / f"{stock}_{date_str}_meta.json"
-    meta_file.write_text(
-        json.dumps(
-            {
-                "stock_code": report.stock_code,
-                "stock_name": report.stock_name,
-                "report_date": date_str,
-                "depth": report.depth,
-                "chart_pack_count": len(report.chart_pack),
-                "evidence_pack_count": len(report.evidence_pack),
-                "agents_completed": report.agents_completed,
-                "agents_skipped": report.agents_skipped,
-                "errors": report.errors,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    meta_payload = json.dumps(
+        {
+            "stock_code": report.stock_code,
+            "stock_name": report.stock_name,
+            "report_date": date_str,
+            "depth": report.depth,
+            "chart_pack_count": len(report.chart_pack),
+            "evidence_pack_count": len(report.evidence_pack),
+            "agents_completed": report.agents_completed,
+            "agents_skipped": report.agents_skipped,
+            "quality_gate": report.quality_gate.model_dump(mode="json") if report.quality_gate else None,
+            "baseline_snapshot": report.baseline_snapshot.model_dump(mode="json") if report.baseline_snapshot else None,
+            "errors": report.errors,
+        },
+        ensure_ascii=False,
+        indent=2,
     )
+    meta_file = out_path / f"{stock}_{date_str}_meta.json"
+    meta_file.write_text(meta_payload, encoding="utf-8")
+    (out_path / f"{stock}_meta.json").write_text(meta_payload, encoding="utf-8")
 
     _print_conclusion(report)
     _print_execution_summary(report)
@@ -257,6 +294,83 @@ async def _run_update(args: argparse.Namespace) -> None:
             print(f"  [INFO] [增量更新] 新增{label}: {count}条")
 
     print(f"  [INFO] [增量更新] 更新完成 | 耗时: {duration:.1f}s")
+
+
+async def _run_regression(args: argparse.Namespace) -> None:
+    """Run the fixed regression basket and persist structured baselines."""
+    from .core.regression import (
+        compare_baseline_snapshots,
+        get_default_regression_sample_basket,
+        load_regression_baseline_file,
+    )
+    from .decision_layer.coordinator import ResearchCoordinator
+
+    basket = get_default_regression_sample_basket()
+    baseline_index = load_regression_baseline_file(args.baseline_file) if args.baseline_file else {}
+    out_path = Path(args.output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    samples: list[dict[str, object]] = []
+    comparison_failures = 0
+    missing_snapshot_failures = 0
+
+    for item in basket:
+        stock_code = str(item.get("stock_code") or "").strip()
+        stock_name = str(item.get("stock_name") or "").strip()
+        sector = str(item.get("sector") or "").strip()
+        depth = str(args.depth or item.get("depth") or "deep")
+        print(f"  [INFO] [回归] 运行 {stock_code} {stock_name} | 行业类型: {sector} | depth={depth}")
+
+        coordinator = ResearchCoordinator(progress_callback=_print_progress)
+        report = await coordinator.run_research(stock_code, depth=depth)
+        baseline_snapshot = report.baseline_snapshot.model_dump(mode="json") if report.baseline_snapshot else None
+        quality_gate = report.quality_gate.model_dump(mode="json") if report.quality_gate else None
+        comparison = None
+
+        if baseline_snapshot is None:
+            missing_snapshot_failures += 1
+        elif stock_code in baseline_index:
+            comparison = compare_baseline_snapshots(baseline_snapshot, baseline_index.get(stock_code))
+            if comparison.get("status") == "regressed":
+                comparison_failures += 1
+
+        samples.append(
+            {
+                "stock_code": stock_code,
+                "stock_name": report.stock_name or stock_name,
+                "sector": sector,
+                "depth": depth,
+                "quality_gate": quality_gate,
+                "baseline_snapshot": baseline_snapshot,
+                "errors": list(report.errors or []),
+                "agents_completed": list(report.agents_completed or []),
+                "agents_skipped": list(report.agents_skipped or []),
+                "comparison": comparison,
+            }
+        )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "generated_at": datetime.now().isoformat(),
+        "sample_count": len(samples),
+        "baseline_file": str(args.baseline_file or ""),
+        "comparison_failures": comparison_failures,
+        "missing_snapshot_failures": missing_snapshot_failures,
+        "samples": samples,
+    }
+    regression_file = out_path / f"regression_{timestamp}.json"
+    latest_file = out_path / "latest_regression.json"
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    regression_file.write_text(serialized, encoding="utf-8")
+    latest_file.write_text(serialized, encoding="utf-8")
+
+    print(f"\n  回归结果: {regression_file}")
+    print(f"  样本数: {len(samples)}")
+    print(f"  缺少 baseline_snapshot: {missing_snapshot_failures}")
+    print(f"  基线回退项: {comparison_failures}")
+
+    if args.strict and (comparison_failures > 0 or missing_snapshot_failures > 0):
+        raise RuntimeError("固定回归样本出现基线回退或缺少 baseline_snapshot，请检查 regression 输出。")
 
 
 def _run_watch(args: argparse.Namespace) -> None:

@@ -33,6 +33,11 @@ from investresearch.core.models import (
     CollectorOutput,
 )
 from investresearch.core.trust import aggregate_quality, build_module_profiles, profile_dicts
+from investresearch.core.trust import (
+    build_field_quality_map,
+    contract_dicts,
+    field_quality_dicts,
+)
 
 logger = get_logger("agent.cleaner")
 
@@ -72,6 +77,15 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         if financials_raw:
             cleaned["financials"] = self._clean_financials(financials_raw)
             self.logger.info(f"财务数据清洗完成: {len(cleaned['financials'])} 期")
+            suspect_periods = [
+                str(item.get("report_date"))
+                for item in cleaned["financials"]
+                if isinstance(item, dict) and item.get("_cashflow_suspect_fields")
+            ]
+            if suspect_periods:
+                warnings.append(
+                    f"部分现金流字段量纲疑似异常，已按待验证处理: {', '.join(suspect_periods[:4])}"
+                )
         else:
             warnings.append("无财务数据")
 
@@ -199,16 +213,33 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         else:
             warnings.append("无官方专利资料")
 
+        cross_verification_raw = raw.get("cross_verification")
+        if cross_verification_raw and isinstance(cross_verification_raw, dict):
+            cleaned["cross_verification"] = self._clean_cross_verification(cross_verification_raw)
+            divergent_metrics = cleaned["cross_verification"].get("divergent_metrics", [])
+            if divergent_metrics:
+                warnings.append(f"澶氭簮浜ゅ弶楠岃瘉鍙戠幇鍒嗘鎸囨爣: {', '.join(divergent_metrics[:4])}")
+            self.logger.info("澶氭簮浜ゅ弶楠岃瘉娓呮礂瀹屾垚")
+
+        cleaned["collection_status"] = dict(raw.get("collection_status", {}) or {})
+        cleaned["collection_errors"] = list(raw.get("errors", []) or [])
+        cleaned["field_statuses"] = dict(raw.get("field_statuses", {}) or {})
+
         profiles = build_module_profiles(cleaned)
         status, completeness, coverage, missing_fields, evidence_refs, source_priority = aggregate_quality(profiles)
         cleaned["module_profiles"] = profile_dicts(profiles)
-        cleaned["collection_status"] = {name: profile.status.value for name, profile in profiles.items()}
+        cleaned["collection_status"] = {
+            **cleaned["collection_status"],
+            **{name: profile.status.value for name, profile in profiles.items()},
+        }
         cleaned["status"] = status.value
         cleaned["completeness"] = completeness
         cleaned["coverage_ratio"] = coverage
         cleaned["missing_fields"] = missing_fields
         cleaned["evidence_refs"] = [ref.model_dump(mode="json") for ref in evidence_refs]
         cleaned["source_priority"] = source_priority
+        cleaned["field_contracts"] = contract_dicts()
+        cleaned["field_quality"] = field_quality_dicts(build_field_quality_map(cleaned))
 
         if coverage < 0.8:
             warnings.append(f"数据覆盖率偏低({coverage:.0%})")
@@ -286,9 +317,15 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
         for f in financials_sorted:
             item = dict(f)  # 浅拷贝
 
-            for field in ["revenue_yoy", "net_profit_yoy", "gross_margin", "net_margin", "debt_ratio", "roe", "cash_to_profit", "goodwill_ratio"]:
+            for field in ["revenue_yoy", "net_profit_yoy", "gross_margin", "net_margin", "debt_ratio", "roe"]:
                 if item.get(field) is not None:
                     item[field] = self._normalize_percent_value(item.get(field))
+            if item.get("goodwill_ratio") is not None:
+                goodwill_ratio = self._safe_float(item.get("goodwill_ratio"))
+                item["goodwill_ratio"] = round(goodwill_ratio, 4) if goodwill_ratio is not None else None
+            if item.get("cash_to_profit") is not None:
+                cash_to_profit = self._safe_float(item.get("cash_to_profit"))
+                item["cash_to_profit"] = round(cash_to_profit, 2) if cash_to_profit is not None else None
 
             # 计算派生指标（如果原始数据有缺失）
             if item.get("net_margin") is None:
@@ -308,6 +345,14 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
                 net_profit = self._safe_float(item.get("net_profit"))
                 if equity and net_profit is not None and equity != 0:
                     item["roe"] = round(net_profit / equity * 100, 2)
+
+            suspect_fields = self._detect_suspicious_cashflow_fields(item)
+            if suspect_fields:
+                for field in suspect_fields:
+                    item[field] = None
+                if "operating_cashflow" in suspect_fields or "free_cashflow" in suspect_fields:
+                    item["cash_to_profit"] = None
+                item["_cashflow_suspect_fields"] = suspect_fields
 
             # 标注数据质量
             has_revenue = item.get("revenue") is not None
@@ -431,6 +476,36 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
 
         cleaned.sort(key=lambda x: str(x.get("announcement_date", "")), reverse=True)
         return cleaned
+
+    @staticmethod
+    def _detect_suspicious_cashflow_fields(item: dict[str, Any]) -> list[str]:
+        """Identify cashflow values that are very likely in a different unit scale."""
+        net_profit = DataCleanerAgent._safe_float(item.get("net_profit"))
+        revenue = DataCleanerAgent._safe_float(item.get("revenue"))
+
+        reference = 0.0
+        if net_profit is not None:
+            reference = max(reference, abs(net_profit))
+        if revenue is not None:
+            reference = max(reference, abs(revenue) * 0.05)
+        if reference < 1e8:
+            return []
+
+        threshold = max(reference * 0.01, 1e6)
+        suspect_fields: list[str] = []
+        for field in ("operating_cashflow", "free_cashflow"):
+            value = DataCleanerAgent._safe_float(item.get(field))
+            if value is None:
+                continue
+            if 0 < abs(value) < threshold:
+                suspect_fields.append(field)
+
+        cash_to_profit = DataCleanerAgent._safe_float(item.get("cash_to_profit"))
+        if cash_to_profit is not None and abs(cash_to_profit) < 0.01 and "operating_cashflow" not in suspect_fields:
+            suspect_fields.append("operating_cashflow")
+        if "operating_cashflow" in suspect_fields and "free_cashflow" not in suspect_fields:
+            suspect_fields.append("free_cashflow")
+        return suspect_fields
 
     def _clean_governance(self, governance: dict) -> dict:
         """清洗治理数据： 标记可用字段、计算完整性"""
@@ -612,6 +687,47 @@ class DataCleanerAgent(AgentBase[AgentInput, AgentOutput]):
                 cleaned["valuation_level"] = "偏高"
             else:
                 cleaned["valuation_level"] = "极高估"
+        return cleaned
+
+    def _clean_cross_verification(self, payload: dict) -> dict:
+        """Normalize cross-verification output for downstream agents."""
+        cleaned = dict(payload)
+        metrics: list[dict[str, Any]] = []
+        for item in cleaned.get("verified_metrics", []) or []:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["confidence_score"] = self._safe_float(item.get("confidence_score")) or 0.0
+            normalized["recommended_value"] = self._safe_float(item.get("recommended_value"))
+            normalized["mean_value"] = self._safe_float(item.get("mean_value"))
+            normalized["median_value"] = self._safe_float(item.get("median_value"))
+            normalized["std_dev"] = self._safe_float(item.get("std_dev"))
+            normalized["min_value"] = self._safe_float(item.get("min_value"))
+            normalized["max_value"] = self._safe_float(item.get("max_value"))
+            normalized["source_count"] = int(self._safe_float(item.get("source_count")) or 0)
+            normalized["sources"] = [str(source) for source in item.get("sources", [])[:6]]
+            normalized["values"] = [
+                value
+                for value in (self._safe_float(source_value) for source_value in item.get("values", []))
+                if value is not None
+            ][:6]
+            normalized["evidence_refs"] = [ref for ref in item.get("evidence_refs", [])[:4] if isinstance(ref, dict)]
+            metrics.append(normalized)
+
+        metrics.sort(
+            key=lambda item: (
+                item.get("consistency_flag") == "divergent",
+                item.get("confidence_score", 0.0),
+                item.get("source_count", 0),
+            ),
+            reverse=True,
+        )
+        cleaned["verified_metrics"] = metrics[:12]
+        cleaned["consistent_metrics"] = [str(item) for item in cleaned.get("consistent_metrics", [])[:8]]
+        cleaned["divergent_metrics"] = [str(item) for item in cleaned.get("divergent_metrics", [])[:8]]
+        cleaned["insufficient_metrics"] = [str(item) for item in cleaned.get("insufficient_metrics", [])[:8]]
+        cleaned["overall_confidence"] = round(self._safe_float(cleaned.get("overall_confidence")) or 0.0, 2)
+        cleaned["summary"] = str(cleaned.get("summary") or "").strip()
         return cleaned
 
     def _clean_news(self, news: list[dict]) -> list[dict]:

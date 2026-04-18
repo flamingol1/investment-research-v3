@@ -76,6 +76,8 @@ llm:
     decision_layer:
       default: "doubao-pro"       # 决策层用豆包pro
       conclusion: "qwen3-plus"    # 结论生成
+      deep_review: "qwen3-plus"   # 深度复核
+      report: "qwen3-plus"        # 报告撰写
       fallback: "qwen3-coder"
     reporting: "qwen3-coder"      # 报告生成
 

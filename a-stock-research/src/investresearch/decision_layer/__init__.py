@@ -3,5 +3,6 @@
 from .coordinator import ResearchCoordinator
 from .report import ReportAgent
 from .conclusion import ConclusionAgent
+from .deep_research_review import DeepResearchReviewAgent
 
-__all__ = ["ResearchCoordinator", "ReportAgent", "ConclusionAgent"]
+__all__ = ["ResearchCoordinator", "ReportAgent", "ConclusionAgent", "DeepResearchReviewAgent"]

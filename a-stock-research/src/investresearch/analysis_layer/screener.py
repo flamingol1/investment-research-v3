@@ -70,6 +70,7 @@ class ScreenerAgent(AgentBase[AgentInput, AgentOutput]):
     """初筛Agent - 快速排雷，判断是否值得深度研究"""
 
     agent_name: str = "screener"
+    execution_mode: str = "llm"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
         """执行初筛分析"""
@@ -104,6 +105,8 @@ class ScreenerAgent(AgentBase[AgentInput, AgentOutput]):
             data_sources=["akshare", "baostock"],
             confidence=result.get("confidence", 0.5),
             summary=summary,
+            llm_invoked=True,
+            model_used=model,
         )
 
     def validate_output(self, output: AgentOutput) -> None:

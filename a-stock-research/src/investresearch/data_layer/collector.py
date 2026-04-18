@@ -56,10 +56,19 @@ from investresearch.core.models import (
     PolicyDocument,
     ComplianceEvent,
     PatentRecord,
+    FieldCollectionStatus,
+    FieldValueState,
 )
-from investresearch.core.trust import aggregate_quality, build_module_profiles, profile_dicts
+from investresearch.core.trust import (
+    aggregate_quality,
+    build_field_quality_map,
+    build_module_profiles,
+    contract_models,
+    profile_dicts,
+)
 
 from .cache import FileCache
+from .cross_verify import CrossVerificationEngine
 from .official_sources import OfficialSourceRegistry
 
 logger = get_logger("agent.collector")
@@ -76,6 +85,14 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
     """
 
     agent_name: str = "data_collector"
+    _ANNOUNCEMENT_EVIDENCE_ONLY_FINANCIAL_FIELDS = frozenset(
+        {
+            "operating_cashflow",
+            "investing_cashflow",
+            "financing_cashflow",
+            "free_cashflow",
+        }
+    )
 
     def __init__(self, cache: FileCache | None = None) -> None:
         super().__init__()
@@ -98,6 +115,26 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         if context:
             msg += f" | {context}"
         self.logger.warning(msg)
+
+    @staticmethod
+    def _record_field_status(
+        result: CollectorOutput,
+        field_name: str,
+        *,
+        value_state: FieldValueState,
+        sources_checked: list[str] | None = None,
+        reference_date: str = "",
+        note: str = "",
+    ) -> None:
+        statuses = dict(result.field_statuses or {})
+        statuses[field_name] = FieldCollectionStatus(
+            field=field_name,
+            value_state=value_state,
+            sources_checked=list(sources_checked or []),
+            reference_date=reference_date,
+            note=note,
+        )
+        result.field_statuses = statuses
 
     # ================================================================
     # 主入口
@@ -147,6 +184,12 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         # 跨源填补缺失字段
         self._fill_missing_fields(stock_code, result)
+        result.cross_verification = CrossVerificationEngine().build_data_cross_verification(
+            stock_code=stock_code,
+            financials=result.financials,
+            realtime=result.realtime,
+            valuation_percentile=result.valuation_percentile.model_dump(mode="json") if result.valuation_percentile else {},
+        )
 
         profiles = build_module_profiles(result.model_dump(mode="json"))
         (
@@ -159,6 +202,8 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         ) = aggregate_quality(profiles)
         result.module_profiles = profiles
         result.collection_status = {name: profile.status.value for name, profile in profiles.items()}
+        result.field_contracts = contract_models()
+        result.field_quality = build_field_quality_map(result.model_dump(mode="json"))
 
         self.logger.info(
             f"采集完成 | 状态={result.status.value} | 覆盖率={result.coverage_ratio:.0%} | 完整度={result.completeness:.0%}"
@@ -437,26 +482,71 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                 row = df[df["代码"] == stock_code]
                 if not row.empty:
                     row = row.iloc[0]
-                    result.realtime = StockPrice(
-                        code=stock_code,
-                        date=date.today(),
-                        open=self._safe_float(row.get("今开")),
-                        close=self._safe_float(row.get("最新价")),
-                        high=self._safe_float(row.get("最高")),
-                        low=self._safe_float(row.get("最低")),
-                        volume=self._safe_float(row.get("成交量")),
-                        amount=self._safe_float(row.get("成交额")),
-                        turnover_rate=self._safe_float(row.get("换手率")),
-                        pe_ttm=self._safe_float(row.get("市盈率-动态")),
-                        pb_mrq=self._safe_float(row.get("市净率")),
-                        market_cap=self._safe_float(row.get("总市值")),
+                    self._apply_realtime_observation(
+                        stock_code,
+                        result,
+                        source_name="eastmoney_realtime",
+                        metrics={
+                            "open": self._safe_float(row.get("今开")),
+                            "close": self._safe_float(row.get("最新价")),
+                            "high": self._safe_float(row.get("最高")),
+                            "low": self._safe_float(row.get("最低")),
+                            "volume": self._safe_float(row.get("成交量")),
+                            "amount": self._safe_float(row.get("成交额")),
+                            "turnover_rate": self._safe_float(row.get("换手率")),
+                            "pe_ttm": self._safe_float(row.get("市盈率-动态")),
+                            "pb_mrq": self._safe_float(row.get("市净率")),
+                            "market_cap": self._safe_float(row.get("总市值")),
+                        },
+                        source_type="market_quote",
+                        prefer_source_values=True,
                     )
-                    return
         except Exception as e:
             self.logger.warning(f"东方财富实时行情失败，切换新浪源: {e}")
 
-        # 备源: 新浪财经
+        # 备源: 新浪财经。即便主源成功也保留备源观测，供后续交叉验证使用。
         self._get_realtime_quote_sina(stock_code, result)
+
+    def _apply_realtime_observation(
+        self,
+        stock_code: str,
+        result: CollectorOutput,
+        *,
+        source_name: str,
+        metrics: dict[str, Any],
+        source_type: str = "market_quote",
+        prefer_source_values: bool = False,
+    ) -> None:
+        """Merge one realtime source snapshot while preserving per-source observations."""
+        normalized_metrics = {
+            key: value
+            for key, value in (metrics or {}).items()
+            if value not in (None, "", [], {})
+        }
+        if not normalized_metrics:
+            return
+
+        raw_data = self._merge_source_values(
+            dict(result.realtime.raw_data or {}) if result.realtime else {},
+            source_name=source_name,
+            metrics=normalized_metrics,
+            source_type=source_type,
+            reference_date=date.today().isoformat(),
+        )
+        if result.realtime is None:
+            result.realtime = StockPrice(
+                code=stock_code,
+                date=date.today(),
+                raw_data=raw_data,
+                **normalized_metrics,
+            )
+            return
+
+        updates: dict[str, Any] = {"raw_data": raw_data}
+        for field_name, value in normalized_metrics.items():
+            if prefer_source_values or getattr(result.realtime, field_name, None) is None:
+                updates[field_name] = value
+        result.realtime = result.realtime.model_copy(update=updates)
 
     # ================================================================
     # 4. 财务报表
@@ -464,7 +554,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
     def _get_financial_statements(self, stock_code: str, result: CollectorOutput) -> None:
         """采集财务报表 - 三级备源链: AKShare详细→AKShare简化→BaoStock"""
-        cache_key = f"financials_{stock_code}_v2"
+        cache_key = f"financials_{stock_code}_v7"
         cached = self._get_from_cache(cache_key)
         if cached:
             result.financials = [FinancialStatement(**f) for f in cached]
@@ -489,6 +579,10 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         # 第三级: BaoStock财务数据备源（填补缺失字段或全部补充）
         self._get_financial_baostock(stock_code, result)
+        self._supplement_financial_profit_em(stock_code, result)
+        self._supplement_financial_balance_em(stock_code, result)
+        self._supplement_goodwill_ratio_ths(stock_code, result)
+        self._supplement_financial_cashflow_em(stock_code, result)
 
         if result.financials:
             self._save_to_cache(
@@ -513,21 +607,62 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                     if report_date is None:
                         continue
 
+                    report_date_text = report_date.isoformat()
+                    eps_basic = self._safe_float(row.get("基本每股收益"))
+                    book_value_per_share = self._safe_float(row.get("每股净资产"))
+                    operating_cashflow_per_share = self._safe_float(row.get("每股经营现金流"))
+
                     fs = FinancialStatement(
                         code=stock_code,
                         report_date=report_date,
-                        report_type="annual",
+                        report_type=self._guess_quarter(report_date_text),
                         source=DataSource.AKSHARE,
                         revenue=self._safe_float(row.get("营业总收入")),
+                        revenue_yoy=self._safe_percent_value(row.get("营业总收入同比增长率")),
                         net_profit=self._safe_float(row.get("净利润")),
+                        net_profit_yoy=self._safe_percent_value(row.get("净利润同比增长率")),
+                        deduct_net_profit=self._safe_float(row.get("扣非净利润")),
                         total_assets=self._safe_float(row.get("总资产")),
                         equity=self._safe_float(row.get("所有者权益合计")),
                         operating_cashflow=self._safe_float(row.get("经营活动产生的现金流量净额")),
                         roe=self._safe_percent_value(row.get("净资产收益率(%)")),
                         gross_margin=self._safe_percent_value(row.get("销售毛利率(%)")),
                         net_margin=self._safe_percent_value(row.get("销售净利率(%)")),
+                        current_ratio=self._safe_float(row.get("流动比率")),
+                        quick_ratio=self._safe_float(row.get("速动比率")),
+                        debt_ratio=self._safe_percent_value(row.get("资产负债率")),
+                        inventory_turnover=self._safe_float(row.get("存货周转率")),
+                        raw_data={
+                            "source_table": "stock_financial_abstract_ths",
+                            "eps_basic": eps_basic,
+                            "book_value_per_share": book_value_per_share,
+                            "operating_cashflow_per_share": operating_cashflow_per_share,
+                            "ownership_ratio": self._safe_float(row.get("产权比率")),
+                            "inventory_turnover_days": self._safe_float(row.get("存货周转天数")),
+                            "receivable_turnover_days": self._safe_float(row.get("应收账款周转天数")),
+                        },
                     )
                     # 计算派生指标
+                    fs = fs.model_copy(
+                        update={
+                            "raw_data": self._merge_source_values(
+                                fs.raw_data,
+                                source_name="akshare_financial_abstract",
+                                metrics={
+                                    "revenue": fs.revenue,
+                                    "net_profit": fs.net_profit,
+                                    "equity": fs.equity,
+                                    "operating_cashflow": fs.operating_cashflow,
+                                    "gross_margin": fs.gross_margin,
+                                    "net_margin": fs.net_margin,
+                                    "debt_ratio": fs.debt_ratio,
+                                    "roe": fs.roe,
+                                },
+                                source_type="official_statement",
+                                reference_date=report_date_text,
+                            )
+                        }
+                    )
                     if fs.total_assets and fs.total_liabilities is None and fs.equity:
                         fs.debt_ratio = self._safe_pct(fs.total_assets - fs.equity, fs.total_assets)
 
@@ -582,6 +717,10 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                         "gross_margin": self._safe_percent_value(row[5]),
                         "net_profit": self._safe_float(row[6]),
                         "revenue": self._safe_float(row[8]),
+                        "_eps_ttm": self._safe_float(row[7]),
+                        "_total_share": self._safe_float(row[9]),
+                        "_liquid_share": self._safe_float(row[10]),
+                        "_pub_date": row[1],
                     },
                 )
 
@@ -593,6 +732,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                         "current_ratio": self._safe_float(row[3]),
                         "quick_ratio": self._safe_float(row[4]),
                         "debt_ratio": self._resolve_baostock_debt_ratio(row[7], row[8]),
+                        "_asset_to_equity": self._safe_float(row[8]),
                     },
                 )
 
@@ -601,7 +741,6 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                     bs, bs_code, start_year, merged,
                     "query_growth_data",
                     lambda row: {
-                        "revenue_yoy": self._safe_percent_value(row[6]),
                         "net_profit_yoy": self._safe_percent_value(row[5]),
                     },
                 )
@@ -641,10 +780,30 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                         # 补充缺失字段
                         updated = False
                         update_dict = {}
+                        raw_data = dict(matched_fs.raw_data or {})
+                        source_snapshot = {
+                            key: val
+                            for key, val in fields.items()
+                            if not key.startswith("_") and val is not None
+                        }
                         for key, val in fields.items():
+                            if key.startswith("_"):
+                                if val is not None and raw_data.get(key[1:]) in (None, "", [], {}):
+                                    raw_data[key[1:]] = val
+                                    updated = True
+                                continue
                             if val is not None and getattr(matched_fs, key, None) is None:
                                 update_dict[key] = val
                                 updated = True
+                        raw_data = self._merge_source_values(
+                            raw_data,
+                            source_name="baostock_financials",
+                            metrics=source_snapshot,
+                            source_type="official_statement",
+                            reference_date=stat_date_str,
+                        )
+                        if raw_data != (matched_fs.raw_data or {}):
+                            update_dict["raw_data"] = raw_data
                         if updated:
                             idx = result.financials.index(matched_fs)
                             result.financials[idx] = matched_fs.model_copy(update=update_dict)
@@ -652,12 +811,30 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                     elif stat_date_str not in existing_dates:
                         # 新增报告期
                         quarter = self._guess_quarter(stat_date_str)
+                        model_fields = {
+                            k: v
+                            for k, v in fields.items()
+                            if not k.startswith("_") and v is not None
+                        }
+                        raw_data = {
+                            k[1:]: v
+                            for k, v in fields.items()
+                            if k.startswith("_") and v is not None
+                        } or None
+                        raw_data = self._merge_source_values(
+                            raw_data,
+                            source_name="baostock_financials",
+                            metrics=model_fields,
+                            source_type="official_statement",
+                            reference_date=stat_date_str,
+                        )
                         fs = FinancialStatement(
                             code=stock_code,
                             report_date=report_date,
                             report_type=quarter,
                             source=DataSource.BAOSTOCK,
-                            **{k: v for k, v in fields.items() if v is not None},
+                            raw_data=raw_data,
+                            **model_fields,
                         )
                         result.financials.append(fs)
                         new_count += 1
@@ -675,6 +852,64 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         except Exception as e:
             self._log_failure("financials", "baostock", e)
+
+    def _supplement_financial_cashflow_em(self, stock_code: str, result: CollectorOutput) -> None:
+        """Use Eastmoney cashflow statements to restore official cashflow fields."""
+        symbol = self._to_eastmoney_symbol(stock_code)
+        if not symbol:
+            return
+
+        try:
+            df = self._akshare_call("stock_cash_flow_sheet_by_report_em", symbol=symbol)
+            if df is None or df.empty:
+                return
+            result.financials = self._merge_official_cashflow_rows(stock_code, result.financials, df)
+            self.logger.info(f"Eastmoney鐜伴噾娴侀噺琛? {len(df)} 鏉℃姤鍛婃湡")
+        except Exception as e:
+            self._log_failure("financials_cashflow", "eastmoney", e, "stock_cash_flow_sheet_by_report_em")
+
+    def _supplement_financial_profit_em(self, stock_code: str, result: CollectorOutput) -> None:
+        """Use Eastmoney profit statements to add a second official source for income metrics."""
+        symbol = self._to_eastmoney_symbol(stock_code)
+        if not symbol:
+            return
+
+        try:
+            df = self._akshare_call("stock_profit_sheet_by_report_em", symbol=symbol)
+            if df is None or df.empty:
+                return
+            result.financials = self._merge_official_profit_rows(stock_code, result.financials, df)
+            self.logger.info(f"Eastmoney利润表: {len(df)} 条报告期")
+        except Exception as e:
+            self._log_failure("financials_profit", "eastmoney", e, "stock_profit_sheet_by_report_em")
+
+    def _supplement_financial_balance_em(self, stock_code: str, result: CollectorOutput) -> None:
+        """Use Eastmoney balance-sheet rows to restore official balance metrics."""
+        symbol = self._to_eastmoney_symbol(stock_code)
+        if not symbol:
+            return
+
+        try:
+            df = self._akshare_call("stock_balance_sheet_by_report_em", symbol=symbol)
+            if df is None or df.empty:
+                return
+            result.financials = self._merge_official_balance_rows(stock_code, result.financials, df)
+            self.logger.info(f"Eastmoney资产负债表: {len(df)} 条报告期")
+        except Exception as e:
+            self._log_failure("financials_balance", "eastmoney", e, "stock_balance_sheet_by_report_em")
+
+    def _supplement_goodwill_ratio_ths(self, stock_code: str, result: CollectorOutput) -> None:
+        """Restore goodwill ratio from THS balance-sheet details when the abstract table misses it."""
+        try:
+            df = self._akshare_call("stock_financial_debt_new_ths", symbol=stock_code, indicator="按报告期")
+            if df is None or df.empty or "metric_name" not in df.columns:
+                return
+            df = df[df["metric_name"] == "goodwill"]
+            if df.empty:
+                return
+            result.financials = self._merge_goodwill_rows(result.financials, df)
+        except Exception as e:
+            self._log_failure("financials_goodwill", "akshare", e, "stock_financial_debt_new_ths")
 
     def _baostock_query_merge(
         self,
@@ -727,6 +962,419 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
     # ================================================================
     # 5. 估值数据 (BaoStock)
     # ================================================================
+
+    @staticmethod
+    def _to_eastmoney_symbol(code: str) -> str:
+        """股票代码转东方财富格式: 600519 -> SH600519"""
+        if code.startswith(("SH", "SZ", "BJ")):
+            return code
+        if code.startswith(("6", "9")):
+            return f"SH{code}"
+        if code.startswith(("0", "3")):
+            return f"SZ{code}"
+        if code.startswith(("4", "8")):
+            return f"BJ{code}"
+        return ""
+
+    @staticmethod
+    def _derive_free_cashflow(
+        operating_cashflow: float | None,
+        capital_expenditure: float | None,
+        investing_cashflow: float | None,
+    ) -> float | None:
+        """Prefer CFO-capex for FCF; fall back to CFO + investing only when capex is unavailable."""
+        if operating_cashflow is not None and capital_expenditure is not None:
+            return round(float(operating_cashflow) - float(capital_expenditure), 2)
+        if operating_cashflow is not None and investing_cashflow is not None:
+            return round(float(operating_cashflow) + float(investing_cashflow), 2)
+        return None
+
+    @staticmethod
+    def _merge_official_profit_rows(
+        stock_code: str,
+        financials: list[FinancialStatement],
+        df: pd.DataFrame,
+    ) -> list[FinancialStatement]:
+        """Merge official Eastmoney profit rows into the current financial timeline."""
+        merged = list(financials)
+        index_by_date = {
+            item.report_date.strftime("%Y-%m-%d"): idx
+            for idx, item in enumerate(merged)
+            if item.report_date
+        }
+
+        for _, row in df.iterrows():
+            report_date = DataCollectorAgent._parse_date(str(row.get("REPORT_DATE", ""))[:10])
+            if report_date is None:
+                continue
+
+            revenue = DataCollectorAgent._safe_float(row.get("TOTAL_OPERATE_INCOME"))
+            if revenue is None:
+                revenue = DataCollectorAgent._safe_float(row.get("OPERATE_INCOME"))
+            net_profit = DataCollectorAgent._safe_float(row.get("PARENT_NETPROFIT"))
+            if net_profit is None:
+                net_profit = DataCollectorAgent._safe_float(row.get("NETPROFIT"))
+            deduct_net_profit = DataCollectorAgent._safe_float(row.get("DEDUCT_PARENT_NETPROFIT"))
+            revenue_yoy = DataCollectorAgent._safe_float(row.get("TOTAL_OPERATE_INCOME_YOY"))
+            if revenue_yoy is None:
+                revenue_yoy = DataCollectorAgent._safe_float(row.get("OPERATE_INCOME_YOY"))
+            net_profit_yoy = DataCollectorAgent._safe_float(row.get("PARENT_NETPROFIT_YOY"))
+            if net_profit_yoy is None:
+                net_profit_yoy = DataCollectorAgent._safe_float(row.get("NETPROFIT_YOY"))
+            notice_date = DataCollectorAgent._parse_date(str(row.get("NOTICE_DATE", ""))[:10])
+            report_date_key = report_date.isoformat()
+
+            raw_profit = {
+                "profit_statement_source": "stock_profit_sheet_by_report_em",
+                "profit_notice_date": notice_date.isoformat() if notice_date else None,
+                "basic_eps": DataCollectorAgent._safe_float(row.get("BASIC_EPS")),
+            }
+            raw_profit = {k: v for k, v in raw_profit.items() if v not in (None, "", [], {})}
+            metrics = {
+                "revenue": revenue,
+                "net_profit": net_profit,
+                "deduct_net_profit": deduct_net_profit,
+                "revenue_yoy": revenue_yoy,
+                "net_profit_yoy": net_profit_yoy,
+            }
+
+            if report_date_key in index_by_date:
+                existing = merged[index_by_date[report_date_key]]
+                updates = {
+                    field_name: value
+                    for field_name, value in (
+                        ("revenue", revenue),
+                        ("net_profit", net_profit),
+                        ("deduct_net_profit", deduct_net_profit),
+                        ("revenue_yoy", revenue_yoy),
+                        ("net_profit_yoy", net_profit_yoy),
+                    )
+                    if value is not None and getattr(existing, field_name, None) in (None, "", [], {})
+                }
+                raw_data = dict(existing.raw_data or {})
+                if raw_profit:
+                    raw_data.update(raw_profit)
+                raw_data = DataCollectorAgent._merge_source_values(
+                    raw_data,
+                    source_name="eastmoney_profit",
+                    metrics=metrics,
+                    source_type="official_statement",
+                    reference_date=report_date_key,
+                )
+                if raw_data:
+                    updates["raw_data"] = raw_data
+                if updates:
+                    merged[index_by_date[report_date_key]] = existing.model_copy(update=updates)
+                continue
+
+            if all(value is None for value in (revenue, net_profit, deduct_net_profit)):
+                continue
+
+            merged.append(
+                FinancialStatement(
+                    code=stock_code,
+                    report_date=report_date,
+                    report_type=DataCollectorAgent._guess_quarter(report_date_key),
+                    source=DataSource.EASTMONEY,
+                    revenue=revenue,
+                    revenue_yoy=revenue_yoy,
+                    net_profit=net_profit,
+                    net_profit_yoy=net_profit_yoy,
+                    deduct_net_profit=deduct_net_profit,
+                    raw_data=DataCollectorAgent._merge_source_values(
+                        raw_profit or None,
+                        source_name="eastmoney_profit",
+                        metrics=metrics,
+                        source_type="official_statement",
+                        reference_date=report_date_key,
+                    ),
+                )
+            )
+            index_by_date[report_date_key] = len(merged) - 1
+
+        merged.sort(key=lambda value: value.report_date or date.min, reverse=True)
+        return merged
+
+    @staticmethod
+    def _merge_official_balance_rows(
+        stock_code: str,
+        financials: list[FinancialStatement],
+        df: pd.DataFrame,
+    ) -> list[FinancialStatement]:
+        """Merge official Eastmoney balance-sheet rows into the current financial timeline."""
+        merged = list(financials)
+        index_by_date = {
+            item.report_date.strftime("%Y-%m-%d"): idx
+            for idx, item in enumerate(merged)
+            if item.report_date
+        }
+
+        for _, row in df.iterrows():
+            report_date = DataCollectorAgent._parse_date(str(row.get("REPORT_DATE", ""))[:10])
+            if report_date is None:
+                continue
+
+            total_assets = DataCollectorAgent._safe_float(row.get("TOTAL_ASSETS"))
+            total_liabilities = DataCollectorAgent._safe_float(row.get("TOTAL_LIABILITIES"))
+            equity = DataCollectorAgent._safe_float(row.get("PARENT_EQUITY_BALANCE"))
+            if equity in (None, 0):
+                equity = DataCollectorAgent._safe_float(row.get("TOTAL_EQUITY"))
+            contract_liabilities = DataCollectorAgent._safe_float(row.get("CONTRACT_LIAB"))
+            goodwill_amount = DataCollectorAgent._safe_float(row.get("GOODWILL"))
+            debt_ratio = None
+            if total_assets not in (None, 0) and total_liabilities is not None:
+                debt_ratio = round(float(total_liabilities) / float(total_assets) * 100, 2)
+            goodwill_ratio = None
+            if goodwill_amount is not None and equity not in (None, 0):
+                goodwill_ratio = round(float(goodwill_amount) / float(equity) * 100, 4)
+            notice_date = DataCollectorAgent._parse_date(str(row.get("NOTICE_DATE", ""))[:10])
+            report_date_key = report_date.isoformat()
+
+            raw_balance = {
+                "balance_statement_source": "stock_balance_sheet_by_report_em",
+                "balance_notice_date": notice_date.isoformat() if notice_date else None,
+                "goodwill_amount": goodwill_amount,
+            }
+            raw_balance = {k: v for k, v in raw_balance.items() if v not in (None, "", [], {})}
+            metrics = {
+                "equity": equity,
+                "total_assets": total_assets,
+                "total_liabilities": total_liabilities,
+                "debt_ratio": debt_ratio,
+                "goodwill_ratio": goodwill_ratio,
+                "contract_liabilities": contract_liabilities,
+            }
+
+            if report_date_key in index_by_date:
+                existing = merged[index_by_date[report_date_key]]
+                updates = {
+                    field_name: value
+                    for field_name, value in (
+                        ("equity", equity),
+                        ("total_assets", total_assets),
+                        ("total_liabilities", total_liabilities),
+                        ("debt_ratio", debt_ratio),
+                        ("goodwill_ratio", goodwill_ratio),
+                        ("contract_liabilities", contract_liabilities),
+                    )
+                    if value is not None and getattr(existing, field_name, None) in (None, "", [], {})
+                }
+                raw_data = dict(existing.raw_data or {})
+                if raw_balance:
+                    raw_data.update(raw_balance)
+                raw_data = DataCollectorAgent._merge_source_values(
+                    raw_data,
+                    source_name="eastmoney_balance",
+                    metrics=metrics,
+                    source_type="official_statement",
+                    reference_date=report_date_key,
+                )
+                if raw_data:
+                    updates["raw_data"] = raw_data
+                if updates:
+                    merged[index_by_date[report_date_key]] = existing.model_copy(update=updates)
+                continue
+
+            if all(value is None for value in (equity, total_assets, total_liabilities, contract_liabilities, goodwill_ratio)):
+                continue
+
+            merged.append(
+                FinancialStatement(
+                    code=stock_code,
+                    report_date=report_date,
+                    report_type=DataCollectorAgent._guess_quarter(report_date_key),
+                    source=DataSource.EASTMONEY,
+                    equity=equity,
+                    total_assets=total_assets,
+                    total_liabilities=total_liabilities,
+                    debt_ratio=debt_ratio,
+                    goodwill_ratio=goodwill_ratio,
+                    contract_liabilities=contract_liabilities,
+                    raw_data=DataCollectorAgent._merge_source_values(
+                        raw_balance or None,
+                        source_name="eastmoney_balance",
+                        metrics=metrics,
+                        source_type="official_statement",
+                        reference_date=report_date_key,
+                    ),
+                )
+            )
+            index_by_date[report_date_key] = len(merged) - 1
+
+        merged.sort(key=lambda value: value.report_date or date.min, reverse=True)
+        return merged
+
+    @staticmethod
+    def _merge_goodwill_rows(
+        financials: list[FinancialStatement],
+        df: pd.DataFrame,
+    ) -> list[FinancialStatement]:
+        """Backfill goodwill ratio from THS balance-sheet detail rows."""
+        merged = list(financials)
+        index_by_date = {
+            item.report_date.strftime("%Y-%m-%d"): idx
+            for idx, item in enumerate(merged)
+            if item.report_date
+        }
+
+        for _, row in df.iterrows():
+            report_date = DataCollectorAgent._parse_date(str(row.get("report_date", ""))[:10])
+            goodwill = DataCollectorAgent._safe_float(row.get("value"))
+            if report_date is None or goodwill is None:
+                continue
+
+            report_date_key = report_date.isoformat()
+            idx = index_by_date.get(report_date_key)
+            if idx is None:
+                continue
+
+            existing = merged[idx]
+            raw_data = dict(existing.raw_data or {})
+            total_share = DataCollectorAgent._safe_float(raw_data.get("total_share"))
+            book_value_per_share = DataCollectorAgent._safe_float(raw_data.get("book_value_per_share"))
+            equity = existing.equity
+            if equity is None and total_share not in (None, 0) and book_value_per_share is not None:
+                equity = float(total_share) * float(book_value_per_share)
+            if equity in (None, 0):
+                continue
+
+            updates: dict[str, Any] = {
+                "goodwill_ratio": round(float(goodwill) / float(equity) * 100, 4)
+            }
+            raw_data["goodwill_amount"] = goodwill
+            raw_data["goodwill_source"] = "stock_financial_debt_new_ths"
+            raw_data = DataCollectorAgent._merge_source_values(
+                raw_data,
+                source_name="ths_goodwill_detail",
+                metrics={
+                    "goodwill_ratio": updates["goodwill_ratio"],
+                },
+                source_type="official_statement",
+                reference_date=report_date_key,
+            )
+            updates["raw_data"] = raw_data
+            merged[idx] = existing.model_copy(update=updates)
+
+        merged.sort(key=lambda value: value.report_date or date.min, reverse=True)
+        return merged
+
+    @staticmethod
+    def _merge_official_cashflow_rows(
+        stock_code: str,
+        financials: list[FinancialStatement],
+        df: pd.DataFrame,
+    ) -> list[FinancialStatement]:
+        """Merge official Eastmoney cashflow rows into the current financial timeline."""
+        merged = list(financials)
+        index_by_date = {
+            item.report_date.strftime("%Y-%m-%d"): idx
+            for idx, item in enumerate(merged)
+            if item.report_date
+        }
+
+        for _, row in df.iterrows():
+            report_date = DataCollectorAgent._parse_date(str(row.get("REPORT_DATE", ""))[:10])
+            if report_date is None:
+                continue
+
+            operating_cashflow = DataCollectorAgent._safe_float(row.get("NETCASH_OPERATE"))
+            investing_cashflow = DataCollectorAgent._safe_float(row.get("NETCASH_INVEST"))
+            financing_cashflow = DataCollectorAgent._safe_float(row.get("NETCASH_FINANCE"))
+            capital_expenditure = DataCollectorAgent._safe_float(row.get("CONSTRUCT_LONG_ASSET"))
+            total_invest_outflow = DataCollectorAgent._safe_float(row.get("TOTAL_INVEST_OUTFLOW"))
+            total_invest_inflow = DataCollectorAgent._safe_float(row.get("TOTAL_INVEST_INFLOW"))
+            net_cash_change = DataCollectorAgent._safe_float(row.get("CCE_ADD"))
+            ending_cash_balance = DataCollectorAgent._safe_float(row.get("END_CCE"))
+            notice_date = DataCollectorAgent._parse_date(str(row.get("NOTICE_DATE", ""))[:10])
+
+            free_cashflow = DataCollectorAgent._derive_free_cashflow(
+                operating_cashflow,
+                capital_expenditure,
+                investing_cashflow,
+            )
+            raw_cashflow = {
+                "cashflow_statement_source": "stock_cash_flow_sheet_by_report_em",
+                "cashflow_notice_date": notice_date.isoformat() if notice_date else None,
+                "capital_expenditure": capital_expenditure,
+                "total_invest_outflow": total_invest_outflow,
+                "total_invest_inflow": total_invest_inflow,
+                "net_cash_change": net_cash_change,
+                "ending_cash_balance": ending_cash_balance,
+            }
+            raw_cashflow = {k: v for k, v in raw_cashflow.items() if v not in (None, "", [], {})}
+            report_date_key = report_date.isoformat()
+
+            if report_date_key in index_by_date:
+                existing = merged[index_by_date[report_date_key]]
+                updates: dict[str, Any] = {}
+                if operating_cashflow is not None:
+                    updates["operating_cashflow"] = operating_cashflow
+                if investing_cashflow is not None:
+                    updates["investing_cashflow"] = investing_cashflow
+                if financing_cashflow is not None:
+                    updates["financing_cashflow"] = financing_cashflow
+                if free_cashflow is not None:
+                    updates["free_cashflow"] = free_cashflow
+                if existing.net_profit not in (None, 0) and operating_cashflow is not None:
+                    updates["cash_to_profit"] = round(float(operating_cashflow) / float(existing.net_profit), 2)
+
+                raw_data = dict(existing.raw_data or {})
+                if raw_cashflow:
+                    raw_data.update(raw_cashflow)
+                raw_data = DataCollectorAgent._merge_source_values(
+                    raw_data,
+                    source_name="eastmoney_cashflow",
+                    metrics={
+                        "operating_cashflow": operating_cashflow,
+                        "investing_cashflow": investing_cashflow,
+                        "financing_cashflow": financing_cashflow,
+                        "free_cashflow": free_cashflow,
+                        "cash_to_profit": updates.get("cash_to_profit"),
+                    },
+                    source_type="official_statement",
+                    reference_date=report_date_key,
+                )
+                if raw_data:
+                    updates["raw_data"] = raw_data
+
+                if updates:
+                    merged[index_by_date[report_date_key]] = existing.model_copy(update=updates)
+                continue
+
+            if all(
+                value is None
+                for value in (operating_cashflow, investing_cashflow, financing_cashflow, free_cashflow)
+            ):
+                continue
+
+            merged.append(
+                FinancialStatement(
+                    code=stock_code,
+                    report_date=report_date,
+                    report_type=DataCollectorAgent._guess_quarter(report_date.isoformat()),
+                    source=DataSource.EASTMONEY,
+                    operating_cashflow=operating_cashflow,
+                    investing_cashflow=investing_cashflow,
+                    financing_cashflow=financing_cashflow,
+                    free_cashflow=free_cashflow,
+                    raw_data=DataCollectorAgent._merge_source_values(
+                        raw_cashflow or None,
+                        source_name="eastmoney_cashflow",
+                        metrics={
+                            "operating_cashflow": operating_cashflow,
+                            "investing_cashflow": investing_cashflow,
+                            "financing_cashflow": financing_cashflow,
+                            "free_cashflow": free_cashflow,
+                        },
+                        source_type="official_statement",
+                        reference_date=report_date_key,
+                    ),
+                )
+            )
+            index_by_date[report_date_key] = len(merged) - 1
+
+        merged.sort(key=lambda value: value.report_date or date.min, reverse=True)
+        return merged
 
     def _get_valuation_data(self, stock_code: str, result: CollectorOutput) -> None:
         """通过BaoStock采集估值数据 (PE/PB) - 日频采样"""
@@ -848,15 +1496,20 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             fields = data_str.split(",")
             if len(fields) < 32:
                 return
-            result.realtime = StockPrice(
-                code=stock_code,
-                date=date.today(),
-                open=self._safe_float(fields[1]),
-                close=self._safe_float(fields[3]),
-                high=self._safe_float(fields[4]),
-                low=self._safe_float(fields[5]),
-                volume=self._safe_float(fields[8]),
-                amount=self._safe_float(fields[9]),
+            self._apply_realtime_observation(
+                stock_code,
+                result,
+                source_name="sina_realtime",
+                metrics={
+                    "open": self._safe_float(fields[1]),
+                    "close": self._safe_float(fields[3]),
+                    "high": self._safe_float(fields[4]),
+                    "low": self._safe_float(fields[5]),
+                    "volume": self._safe_float(fields[8]),
+                    "amount": self._safe_float(fields[9]),
+                },
+                source_type="market_quote",
+                prefer_source_values=False,
             )
             self.logger.info("实时行情(新浪源)采集成功")
         except Exception as e:
@@ -943,6 +1596,37 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             except ValueError:
                 continue
         return None
+
+    @staticmethod
+    def _merge_source_values(
+        raw_data: dict[str, Any] | None,
+        *,
+        source_name: str,
+        metrics: dict[str, Any],
+        source_type: str = "unknown",
+        reference_date: str = "",
+    ) -> dict[str, Any]:
+        """Persist source-specific metric observations for later cross verification."""
+        merged = dict(raw_data or {})
+        normalized_metrics = {
+            key: value
+            for key, value in (metrics or {}).items()
+            if value not in (None, "", [], {})
+        }
+        if not normalized_metrics:
+            return merged
+
+        source_values = dict(merged.get("source_values") or {})
+        payload = dict(source_values.get(source_name) or {})
+        payload["source_type"] = source_type or payload.get("source_type") or "unknown"
+        if reference_date:
+            payload["reference_date"] = reference_date
+        metric_payload = dict(payload.get("metrics") or {})
+        metric_payload.update(normalized_metrics)
+        payload["metrics"] = metric_payload
+        source_values[source_name] = payload
+        merged["source_values"] = source_values
+        return merged
 
     @staticmethod
     @staticmethod
@@ -1193,17 +1877,130 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         return ""
 
     @staticmethod
-    def _extract_amount_by_keywords(text: str, keywords: list[str]) -> float | None:
-        """Extract amount after a set of keywords."""
+    def _looks_like_business_scope_text(value: str | None) -> bool:
+        text = DataCollectorAgent._clean_text(value)
+        if not text:
+            return False
+        markers = (
+            "许可项目",
+            "一般项目",
+            "依法须经批准",
+            "经相关部门批准",
+            "经营范围",
+            "技术开发",
+            "技术咨询",
+            "技术服务",
+            "技术转让",
+            "企业管理咨询",
+            "信息系统集成",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        separators = sum(text.count(token) for token in ("；", ";", "、", "，", ","))
+        return len(text) >= 72 and separators >= 4
+
+    @staticmethod
+    def _is_main_business_noise(value: str | None) -> bool:
+        text = DataCollectorAgent._clean_text(value)
+        if not text:
+            return True
+        noise_markers = (
+            "主营业务的变化情况",
+            "主营业务变化情况",
+            "主营业务数据",
+            "数据统计口径",
+            "最近1年按报告期末口径",
+            "与主营业务无关",
+            "无关的业务收入",
+            "公司上市以来主营业务",
+            "变化情况（如有）",
+        )
+        if any(marker in text for marker in noise_markers):
+            return True
+        if re.search(r"(营业收入|净利润|营收)[^。；\n]{0,24}\d", text):
+            return True
+        if re.search(r"\d{4}年\d{1,2}月", text):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_best_main_business_text(text: str, patterns: list[str]) -> str:
+        normalized = DataCollectorAgent._clean_text(text)
+        if not normalized:
+            return ""
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized, flags=re.S):
+                candidate = DataCollectorAgent._normalize_main_business_text(match.group(1))
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+
+        if not candidates:
+            return ""
+
+        business_markers = (
+            "生产",
+            "销售",
+            "研发",
+            "制造",
+            "运营",
+            "服务",
+            "材料",
+            "设备",
+            "酒",
+            "药",
+            "游戏",
+            "软件",
+            "系统",
+            "平台",
+        )
+
+        def score(candidate: str) -> int:
+            score_value = 0
+            if not DataCollectorAgent._is_main_business_noise(candidate):
+                score_value += 4
+            if not DataCollectorAgent._looks_like_business_scope_text(candidate):
+                score_value += 2
+            if 8 <= len(candidate) <= 72:
+                score_value += 2
+            if any(marker in candidate for marker in business_markers):
+                score_value += 1
+            if len(candidate) > 96:
+                score_value -= 2
+            return score_value
+
+        best = max(candidates, key=score)
+        return best if score(best) > 0 else ""
+
+    @staticmethod
+    def _extract_amount_matches_by_keywords(text: str, keywords: list[str]) -> list[float]:
+        values: list[float] = []
         for keyword in keywords:
             pattern = rf"{re.escape(keyword)}[^\n:：]{{0,24}}[:：]?\s*([\-（(]?\d[\d,\.]*)\s*(亿元|万元|元|亿|万)?"
-            match = re.search(pattern, text)
-            if not match:
-                continue
-            value = DataCollectorAgent._parse_chinese_amount(match.group(1), match.group(2) or "")
-            if value is not None:
-                return round(value, 2)
-        return None
+            for match in re.finditer(pattern, text):
+                value = DataCollectorAgent._parse_chinese_amount(match.group(1), match.group(2) or "")
+                if value is not None:
+                    values.append(round(value, 2))
+        return values
+
+    @staticmethod
+    def _extract_amount_by_keywords(
+        text: str,
+        keywords: list[str],
+        *,
+        strategy: str = "first",
+    ) -> float | None:
+        """Extract amount after a set of keywords."""
+        matches = DataCollectorAgent._extract_amount_matches_by_keywords(text, keywords)
+        if not matches:
+            return None
+        if strategy == "largest_abs":
+            return max(matches, key=abs)
+        return matches[0]
 
     @staticmethod
     def _extract_percent_by_keywords(text: str, keywords: list[str]) -> float | None:
@@ -1219,6 +2016,18 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             if abs(raw) <= 1.2:
                 raw *= 100
             return round(raw, 2)
+        return None
+
+    @staticmethod
+    def _extract_percent_by_patterns(text: str, patterns: list[str]) -> float | None:
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.S)
+            if not match:
+                continue
+            raw = DataCollectorAgent._safe_float(match.group(1))
+            if raw is None:
+                continue
+            return round(raw, 4)
         return None
 
     @staticmethod
@@ -1240,6 +2049,26 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         return ""
 
     @staticmethod
+    def _infer_report_period_from_text(text: str) -> str:
+        """Infer report date from explicit report-period phrases inside announcement text."""
+        normalized = str(text or "")
+        patterns = [
+            (r"截至\s*(\d{4})年\s*3月\s*31日", "-03-31"),
+            (r"截至\s*(\d{4})年\s*6月\s*30日", "-06-30"),
+            (r"截至\s*(\d{4})年\s*9月\s*30日", "-09-30"),
+            (r"截至\s*(\d{4})年\s*12月\s*31日", "-12-31"),
+            (r"(\d{4})年\s*1[-—至]\s*3月", "-03-31"),
+            (r"(\d{4})年\s*1[-—至]\s*6月", "-06-30"),
+            (r"(\d{4})年\s*1[-—至]\s*9月", "-09-30"),
+            (r"(\d{4})年度", "-12-31"),
+        ]
+        for pattern, suffix in patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                return f"{match.group(1)}{suffix}"
+        return ""
+
+    @staticmethod
     def _infer_business_model_from_text(text: str) -> str:
         lowered = str(text or "")
         if any(token in lowered for token in ("订阅", "SaaS", "平台", "软件服务")):
@@ -1255,7 +2084,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
     @staticmethod
     def _infer_asset_model_from_text(text: str) -> str:
         lowered = str(text or "")
-        if any(token in lowered for token in ("工厂", "生产线", "设备", "产能", "制造基地")):
+        if any(token in lowered for token in ("工厂", "生产线", "设备", "产能", "制造基地", "生产产品", "生产工艺流程", "原料采购")):
             return "重"
         if any(token in lowered for token in ("软件", "平台", "咨询", "服务", "研发设计")):
             return "轻"
@@ -1280,6 +2109,205 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         return ""
 
     @staticmethod
+    def _extract_percent_from_anchor_window(text: str, keywords: list[str], *, window: int = 1200) -> float | None:
+        """Extract the largest percentage near a section heading."""
+        normalized = DataCollectorAgent._clean_text(text)
+        for keyword in keywords:
+            anchor = normalized.find(keyword)
+            if anchor < 0:
+                continue
+            snippet = normalized[anchor: anchor + window]
+            values: list[float] = []
+            for match in re.finditer(r"(\d+(?:\.\d+)?)\s*%", snippet):
+                ratio = DataCollectorAgent._safe_float(match.group(1))
+                if ratio is None or ratio < 0 or ratio > 100:
+                    continue
+                values.append(ratio)
+            if values:
+                return round(max(values), 4)
+        return None
+
+    @staticmethod
+    def _extract_governance_structured_fields(
+        text: str,
+        *,
+        announcement_date: date | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Extract governance/shareholder hints from annual reports and notices."""
+        normalized = DataCollectorAgent._clean_text(text)
+        if not normalized:
+            return {}, {}, {}
+
+        stock_info_fields: dict[str, Any] = {}
+        governance_fields: dict[str, Any] = {}
+        shareholder_fields: dict[str, Any] = {}
+
+        actual_controller = DataCollectorAgent._extract_text_by_patterns(
+            normalized,
+            [
+                r"(?:实际控制人(?:名称)?|公司实际控制人|本公司实际控制人)[:：]\s*([^\n。；]{2,80})",
+                r"(?:实际控制人为|公司实际控制人为|本公司实际控制人为)\s*([^\n。；]{2,80})",
+            ],
+            max_chars=80,
+        )
+        if not actual_controller and "无实际控制人" in normalized:
+            actual_controller = "无实际控制人"
+        if actual_controller and not any(token in actual_controller for token in ("详见", "说明如下", "不适用")):
+            stock_info_fields["actual_controller"] = actual_controller
+            governance_fields["actual_controller"] = actual_controller
+
+        pledge_ratio = DataCollectorAgent._extract_percent_by_keywords(
+            normalized,
+            [
+                "股权质押比例",
+                "股份质押比例",
+                "累计质押比例",
+                "质押股份占其所持股份比例",
+                "质押股份占公司总股本比例",
+            ],
+        )
+        pledge_absent = any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"(?:不存在|未发生|无)[^\n。；]{0,24}(?:股权质押|股份质押)",
+                r"(?:股份质押|股权质押)[^\n]{0,80}□适用\s*√不适用",
+                r"质押、标记或冻结[\s\S]{0,600}?期末持股数量[\s\S]{0,600}?无",
+            )
+        )
+        if pledge_ratio is not None:
+            governance_fields["equity_pledge_ratio"] = pledge_ratio
+            governance_fields["equity_pledge_checked"] = True
+            governance_fields["pledge_details"] = f"年报披露质押比例约 {pledge_ratio:.2f}%"
+        elif pledge_absent:
+            governance_fields["equity_pledge_checked"] = True
+            governance_fields["equity_pledge_absent"] = True
+            governance_fields["pledge_details"] = "年报披露未见稳定股权质押记录"
+
+        guarantee_amount = DataCollectorAgent._extract_amount_by_keywords(
+            normalized,
+            ["对外担保余额", "担保余额", "担保总额", "违规担保余额"],
+        )
+        guarantee_absent = any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"是否存在违反规定决策程序对外提供担保的情况\s*否",
+                r"(?:对外提供担保|违规担保)[^\n]{0,80}□适用\s*√不适用",
+                r"(?:不存在|未发生|无)[^\n。；]{0,24}(?:违规担保|对外担保)",
+            )
+        )
+        if guarantee_amount is not None:
+            governance_fields["guarantee_info"] = f"年报披露担保余额约 {guarantee_amount:.2f} 元"
+            governance_fields["guarantee_checked"] = True
+        elif guarantee_absent:
+            governance_fields["guarantee_info"] = "年报披露未见违规担保或异常对外担保"
+            governance_fields["guarantee_checked"] = True
+            governance_fields["guarantee_absent"] = True
+
+        lawsuit_excerpt = DataCollectorAgent._extract_text_by_patterns(
+            normalized,
+            [
+                r"(?:重大诉讼、仲裁事项|诉讼、仲裁事项|重大诉讼仲裁事项)[:：]\s*([^\n]{8,120})",
+                r"(?:诉讼、仲裁情况|重大诉讼情况)[:：]\s*([^\n]{8,120})",
+            ],
+            max_chars=120,
+        )
+        lawsuit_absent = any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"(?:重大诉讼、仲裁事项|诉讼、仲裁事项)[^\n]{0,80}□适用\s*√不适用",
+                r"(?:不存在|未发生|无)[^\n。；]{0,24}(?:重大诉讼|重大仲裁|诉讼、仲裁|诉讼仲裁)",
+            )
+        )
+        if lawsuit_excerpt and "不适用" not in lawsuit_excerpt:
+            governance_fields["lawsuit_info"] = lawsuit_excerpt
+            governance_fields["lawsuit_checked"] = True
+        elif lawsuit_absent:
+            governance_fields["lawsuit_info"] = "年报披露未见重大诉讼或仲裁事项"
+            governance_fields["lawsuit_checked"] = True
+            governance_fields["lawsuit_absent"] = True
+
+        management_change_absent = any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"(?:董事、监事和高级管理人员持股变动情况|董监高持股变动情况)[^\n]{0,80}□适用\s*√不适用",
+                r"(?:董事、监事和高级管理人员|董监高)[^\n。；]{0,36}未发生变动",
+            )
+        )
+        management_change_present = any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"(?:公司董事、高级管理人员变动情况|董事、高级管理人员变动情况)[^\n]{0,80}√适用",
+                r"(?:公司董事、高级管理人员变动情况|董事、高级管理人员变动情况)[\s\S]{0,240}?(?:选举|聘任|离任|解任|工作调动)",
+            )
+        )
+        management_change_excerpt = DataCollectorAgent._extract_text_by_patterns(
+            normalized,
+            [
+                r"(?:董事、监事和高级管理人员持股变动情况|董监高持股变动情况)[:：]?\s*([^\n]{8,120})",
+                r"(?:公司董事、高级管理人员变动情况|董事、高级管理人员变动情况)[:：]?\s*([^\n]{8,120})",
+            ],
+            max_chars=120,
+        )
+        if management_change_absent:
+            governance_fields["management_changes_checked"] = True
+            governance_fields["management_changes_absent"] = True
+        elif management_change_present or (
+            management_change_excerpt and any(token in management_change_excerpt for token in ("增持", "减持", "变动", "选举", "聘任", "离任"))
+        ):
+            governance_fields["management_changes_checked"] = True
+            governance_fields["management_changes"] = [
+                {
+                    "name": "公告披露董监高变动",
+                    "change_type": (management_change_excerpt or "年报披露董事/高管变动情况")[:60],
+                    "change_date": announcement_date.isoformat() if announcement_date else "",
+                    "ratio": None,
+                }
+            ]
+
+        management_share_ratio = DataCollectorAgent._extract_percent_by_keywords(
+            normalized,
+            [
+                "董事、监事和高级管理人员持股比例",
+                "董监高持股比例",
+                "管理层持股比例",
+            ],
+        )
+        if management_share_ratio is None:
+            management_share_ratio = DataCollectorAgent._extract_percent_from_anchor_window(
+                normalized,
+                [
+                    "董事、监事和高级管理人员持股情况",
+                    "董事、监事和高级管理人员持股变动情况",
+                    "董监高持股",
+                ],
+            )
+        if management_share_ratio is None:
+            management_share_ratio = DataCollectorAgent._extract_percent_by_patterns(
+                normalized,
+                [
+                    r"(?:董事、监事和高级管理人员|全体董事、监事和高级管理人员)[^\n。]{0,160}?持有本公司股份总数(?:为|合计为)?[\d,\.]+股[^\n。]{0,80}?占总股本比例(?:为)?\s*([\d\.]+)\s*%",
+                    r"(?:现任及报告期内离任董事、监事和高级管理人员)[^\n。]{0,160}?占总股本比例(?:为)?\s*([\d\.]+)\s*%",
+                    r"(?:合计持股数|持股总数)[^\n。]{0,80}?占总股本比例(?:为)?\s*([\d\.]+)\s*%",
+                ],
+            )
+        if management_share_ratio is not None:
+            shareholder_fields["management_share_ratio"] = management_share_ratio
+            shareholder_fields["management_share_ratio_checked"] = True
+        elif any(
+            re.search(pattern, normalized, flags=re.S)
+            for pattern in (
+                r"(?:董事、监事和高级管理人员|董监高)[^\n。；]{0,36}未持有公司股份",
+                r"(?:董事、监事和高级管理人员持股情况|董监高持股情况)[^\n]{0,80}□适用\s*√不适用",
+                r"(?:董事、监事和高级管理人员|现任及报告期内离任董事、监事和高级管理人员)[^\n。]{0,160}?持有本公司股份总数(?:为|合计为)?0(?:\.0+)?股",
+                r"(?:董事、监事和高级管理人员|董监高)[^\n。]{0,80}?(?:未持有本公司股份|未持有公司股份|未直接持有公司股份|未间接持有公司股份)",
+            )
+        ):
+            shareholder_fields["management_share_ratio_checked"] = True
+            shareholder_fields["management_share_ratio_absent"] = True
+
+        return stock_info_fields, governance_fields, shareholder_fields
+
+    @staticmethod
     def _extract_structured_announcement_fields(
         text: str,
         *,
@@ -1294,29 +2322,50 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         if not normalized:
             return {}
 
-        main_business = DataCollectorAgent._extract_text_by_patterns(
+        main_business = DataCollectorAgent._extract_best_main_business_text(
             normalized,
             [
-                r"(?:主营业务|公司主要从事|主要业务为|核心业务为|主要从事的业务)[:：]\s*([^。；\n]{12,220})",
-                r"(?:公司是.*?)(?:从事|聚焦于)([^。；\n]{12,220})",
+                r"(?:主营业务|公司主要从事|主要业务为|主要业务是|公司主要业务为|公司主要业务是|核心业务为|主要从事的业务)[:：]?\s*([^。；\n]{8,220})",
+                r"(?:报告期内公司从事的业务情况[\s\S]{0,40}?公司主要业务(?:是|为))\s*([^。；\n]{8,220})",
+                r"(?:公司是.*?)(?:从事|聚焦于)([^。；\n]{8,220})",
             ],
         )
         if not main_business:
-            fallback_match = re.search(r"公司主要从事([^。；\n]{6,220})", normalized)
-            if fallback_match:
-                main_business = DataCollectorAgent._clean_text(fallback_match.group(1))[:180]
-        business_model = DataCollectorAgent._infer_business_model_from_text(normalized)
+            main_business = DataCollectorAgent._extract_best_main_business_text(
+                normalized,
+                [
+                    r"公司主要从事([^。；\n]{6,220})",
+                    r"主营业务涵盖([^。；\n]{6,220})",
+                ],
+            )
+        direct_business_model = DataCollectorAgent._extract_text_by_patterns(
+            normalized,
+            [
+                r"(?:经营模式(?:为|是)|销售模式(?:为|是)|业务模式(?:为|是))[:：]\s*([^。；\n]{8,160})",
+            ],
+            max_chars=160,
+        )
+        business_model = direct_business_model or DataCollectorAgent._infer_business_model_from_text(normalized)
         asset_model = DataCollectorAgent._infer_asset_model_from_text(normalized)
         client_type = DataCollectorAgent._infer_client_type_from_text(normalized)
-        report_period = DataCollectorAgent._infer_report_period_from_title(title)
+        report_period = (
+            DataCollectorAgent._infer_report_period_from_title(title)
+            or DataCollectorAgent._infer_report_period_from_text(normalized)
+        )
         risk_factors = DataCollectorAgent._extract_highlights(
             normalized,
             keywords=["风险", "不确定", "波动", "减值", "竞争", "政策"],
             limit=5,
         )
+        stock_info_governance, governance_fields, shareholder_fields = (
+            DataCollectorAgent._extract_governance_structured_fields(
+                normalized,
+                announcement_date=announcement_date,
+            )
+        )
 
         financial_snapshot = {
-            "report_date": report_period or (announcement_date.isoformat() if announcement_date else ""),
+            "report_date": report_period,
             "operating_cashflow": DataCollectorAgent._extract_amount_by_keywords(
                 normalized,
                 ["经营活动产生的现金流量净额", "经营现金流量净额", "经营活动现金流量净额"],
@@ -1340,6 +2389,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             "contract_liabilities": DataCollectorAgent._extract_amount_by_keywords(
                 normalized,
                 ["合同负债", "合同负债期末余额"],
+                strategy="largest_abs",
             ),
             "top5_customer_ratio": DataCollectorAgent._extract_percent_by_keywords(
                 normalized,
@@ -1375,6 +2425,26 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             "risk_factors": risk_factors,
             "dividend_plan": dividend_plan,
         }
+        if stock_info_governance:
+            structured["stock_info"].update(
+                {
+                    key: value
+                    for key, value in stock_info_governance.items()
+                    if value not in (None, "", [], {})
+                }
+            )
+        if governance_fields:
+            structured["governance"] = {
+                key: value
+                for key, value in governance_fields.items()
+                if value not in (None, "", [], {})
+            }
+        if shareholder_fields:
+            structured["shareholders"] = {
+                key: value
+                for key, value in shareholder_fields.items()
+                if value not in (None, "", [], {})
+            }
 
         if not any(
             value
@@ -1386,6 +2456,8 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                 structured["financial_snapshot"],
                 risk_factors,
                 dividend_plan,
+                structured.get("governance"),
+                structured.get("shareholders"),
             ]
         ):
             return {}
@@ -1615,6 +2687,35 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             return "年报"
         return fallback
 
+    @staticmethod
+    def _is_preferred_periodic_announcement(title: str, category: str) -> bool:
+        text = str(title or "").strip()
+        if not text:
+            return False
+
+        excluded = ("摘要", "英文", "独立董事", "审计报告", "内部控制", "法律意见书", "业绩预告", "业绩快报")
+        if any(token in text for token in excluded):
+            return False
+
+        if category == "年报":
+            return "年度报告" in text
+        if category == "半年报":
+            return "半年度报告" in text or "半年报" in text
+        if category == "三季报":
+            return "第三季度报告" in text or "三季度报告" in text
+        if category == "一季报":
+            return "第一季度报告" in text or "一季度报告" in text
+        return False
+
+    @staticmethod
+    def _preferred_periodic_announcements(items: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
+        preferred = [
+            item
+            for item in items
+            if DataCollectorAgent._is_preferred_periodic_announcement(item.get("title", ""), category)
+        ]
+        return preferred or items
+
     def _query_cninfo_announcements(
         self,
         stock_code: str,
@@ -1705,7 +2806,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
     def _get_announcements(self, stock_code: str, result: CollectorOutput) -> None:
         """采集公告原文，优先补齐年报/半年报/季报 PDF 摘录。"""
-        cache_key = f"announcements_{stock_code}_v4"
+        cache_key = f"announcements_{stock_code}_v11"
         cached = self._get_from_cache(cache_key)
         if cached:
             result.announcements = [Announcement(**item) for item in cached]
@@ -1728,7 +2829,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         for category in ["年报", "半年报", "三季报", "一季报"]:
             try:
-                append_unique(
+                items = self._preferred_periodic_announcements(
                     self._query_cninfo_announcements(
                         stock_code,
                         category=category,
@@ -1736,6 +2837,10 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                         end_date=end_date,
                         max_pages=2,
                     ),
+                    category,
+                )
+                append_unique(
+                    items,
                     limit=1,
                 )
             except Exception as exc:
@@ -1778,12 +2883,20 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             extracted = (
                 self._extract_pdf_material(
                     pdf_url,
-                    cache_prefix="cninfo_pdf_v3",
+                    cache_prefix="cninfo_pdf_v9",
                     highlight_keywords=highlight_keywords if item.get("announcement_type") in {"年报", "半年报", "三季报", "一季报"} else fallback_keywords,
                     referer=str(item.get("url") or "https://www.cninfo.com.cn/"),
                     document_title=str(item.get("title") or ""),
                     document_date=item.get("announcement_date"),
-                    max_pages=60 if item.get("announcement_type") in {"年报", "半年报"} else 18,
+                    max_pages=(
+                        220
+                        if item.get("announcement_type") == "年报"
+                        else 100
+                        if item.get("announcement_type") == "半年报"
+                        else 40
+                        if item.get("announcement_type") in {"三季报", "一季报"}
+                        else 18
+                    ),
                 )
                 if pdf_url
                 else {
@@ -1981,6 +3094,7 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         cached = self._get_from_cache(cache_key)
         if cached:
             result.industry_enhanced = IndustryEnhancedData(**cached)
+            self._record_industry_enhanced_statuses(result, result.industry_enhanced)
             return
 
         industry_name = ""
@@ -2087,10 +3201,52 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                 row = df.iloc[0]
                 enhanced.industry_pe = self._safe_float(row.get("市盈率", row.iloc[0] if len(row) > 0 else None))
                 enhanced.industry_pb = self._safe_float(row.get("市净率", row.iloc[1] if len(row) > 1 else None))
+                if enhanced.industry_pe is not None:
+                    self._record_field_status(
+                        result,
+                        "industry_enhanced.industry_pe",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_industry_pe_ratio_cninfo"],
+                    )
+                if enhanced.industry_pb is not None:
+                    self._record_field_status(
+                        result,
+                        "industry_enhanced.industry_pb",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_industry_pe_ratio_cninfo"],
+                    )
+            else:
+                self._record_field_status(
+                    result,
+                    "industry_enhanced.industry_pe",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_industry_pe_ratio_cninfo"],
+                )
+                self._record_field_status(
+                    result,
+                    "industry_enhanced.industry_pb",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_industry_pe_ratio_cninfo"],
+                )
         except Exception as exc:
             self._log_failure("industry_pe", "akshare", exc, "stock_industry_pe_ratio_cninfo")
+            self._record_field_status(
+                result,
+                "industry_enhanced.industry_pe",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_industry_pe_ratio_cninfo"],
+                note="行业 PE 采集失败。",
+            )
+            self._record_field_status(
+                result,
+                "industry_enhanced.industry_pb",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_industry_pe_ratio_cninfo"],
+                note="行业 PB 采集失败。",
+            )
 
         result.industry_enhanced = enhanced
+        self._record_industry_enhanced_statuses(result, enhanced)
         if self._has_substantive_model_data(enhanced):
             self._save_to_cache(cache_key, enhanced.model_dump(), ttl=86400)
 
@@ -2127,6 +3283,28 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         )
         result.valuation_percentile = percentile
         return None
+
+    @staticmethod
+    def _normalize_main_business_text(value: str | None) -> str | None:
+        text = DataCollectorAgent._clean_text(value)
+        if not text:
+            return None
+
+        text = re.sub(r"^(?:主营业务|主要业务|核心业务|公司主要从事|主要从事的业务|从事|聚焦于)[:：]?\s*", "", text)
+        text = text.strip("：:；;，,。 ")
+        if len(text) < 8:
+            return None
+
+        if text.startswith(("并", "及", "以及", "形成", "打造", "实现", "推进", "拓展")):
+            return None
+
+        if text.endswith(("创造了", "形成了", "实现了", "打造了", "提升了", "推进了", "拓展了", "包括", "涵盖")):
+            return None
+
+        if DataCollectorAgent._is_main_business_noise(text):
+            return None
+
+        return text[:180]
         """采集估值历史分位数据 - 理杏仁"""
         percentile = ValuationPercentile()
 
@@ -2259,14 +3437,217 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         result.sentiment = sentiment
 
     def _get_governance_data(self, stock_code: str, result: CollectorOutput) -> None:
-        """Derive stable governance basics from stock info."""
+        """Collect governance evidence with explicit checked/failed states."""
         governance = GovernanceData()
         if result.stock_info:
             governance.actual_controller = result.stock_info.actual_controller
             governance.controller_type = result.stock_info.controller_type
-        official_events = result.compliance_events or []
+            if governance.actual_controller:
+                self._record_field_status(
+                    result,
+                    "governance.actual_controller",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_info"],
+                    note="由基础资料回填实控人。",
+                )
 
-        if official_events:
+        try:
+            df = self._akshare_call("stock_hold_control_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                controller = ""
+                for column in df.columns:
+                    text = str(column)
+                    if any(token in text for token in ("控制人", "实控人", "名称")):
+                        controller = str(row.get(column) or "").strip()
+                        if controller:
+                            break
+                if not controller and len(row) > 0:
+                    controller = str(row.iloc[0] or "").strip()
+                if controller:
+                    governance.actual_controller = controller
+                    self._record_field_status(
+                        result,
+                        "governance.actual_controller",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_hold_control_cninfo"],
+                    )
+                elif governance.actual_controller:
+                    self._record_field_status(
+                        result,
+                        "governance.actual_controller",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_info", "stock_hold_control_cninfo"],
+                    )
+                else:
+                    self._record_field_status(
+                        result,
+                        "governance.actual_controller",
+                        value_state=FieldValueState.VERIFIED_ABSENT,
+                        sources_checked=["stock_hold_control_cninfo"],
+                        note="已核查控制权资料，但未提取到稳定实控人字段。",
+                    )
+            elif not governance.actual_controller:
+                self._record_field_status(
+                    result,
+                    "governance.actual_controller",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_hold_control_cninfo"],
+                    note="已核查控制权资料，无公开记录。",
+                )
+        except Exception as exc:
+            self._log_failure("governance_controller", "akshare", exc, "stock_hold_control_cninfo")
+            if governance.actual_controller:
+                self._record_field_status(
+                    result,
+                    "governance.actual_controller",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_info", "stock_hold_control_cninfo"],
+                    note="控制权接口失败，暂沿用基础资料中的实控人信息。",
+                )
+            else:
+                self._record_field_status(
+                    result,
+                    "governance.actual_controller",
+                    value_state=FieldValueState.COLLECTION_FAILED,
+                    sources_checked=["stock_hold_control_cninfo"],
+                    note="控制权数据采集失败。",
+                )
+
+        try:
+            df = self._akshare_call("stock_cg_equity_mortgage_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                governance.pledge_details = f"质押记录{len(df)}条"
+                ratio = None
+                for column in df.columns:
+                    text = str(column)
+                    if "比例" in text or "质押" in text:
+                        ratio = self._safe_float(df.iloc[0].get(column))
+                        if ratio is not None:
+                            break
+                governance.equity_pledge_ratio = ratio
+                self._record_field_status(
+                    result,
+                    "governance.equity_pledge_ratio",
+                    value_state=FieldValueState.PRESENT if ratio is not None else FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_cg_equity_mortgage_cninfo"],
+                    note="已核查股权质押记录。" if ratio is None else "",
+                )
+            else:
+                governance.pledge_details = "已核查无股权质押记录"
+                self._record_field_status(
+                    result,
+                    "governance.equity_pledge_ratio",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_cg_equity_mortgage_cninfo"],
+                    note="已核查无股权质押记录。",
+                )
+        except Exception as exc:
+            self._log_failure("governance_pledge", "akshare", exc, "stock_cg_equity_mortgage_cninfo")
+            self._record_field_status(
+                result,
+                "governance.equity_pledge_ratio",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_cg_equity_mortgage_cninfo"],
+                note="股权质押数据采集失败。",
+            )
+
+        try:
+            df = self._akshare_call("stock_cg_guarantee_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                governance.guarantee_info = f"担保记录{len(df)}条"
+                self._record_field_status(
+                    result,
+                    "governance.guarantee_info",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_cg_guarantee_cninfo"],
+                )
+            else:
+                governance.guarantee_info = "已核查无担保记录"
+                self._record_field_status(
+                    result,
+                    "governance.guarantee_info",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_cg_guarantee_cninfo"],
+                    note="已核查无担保记录。",
+                )
+        except Exception as exc:
+            self._log_failure("governance_guarantee", "akshare", exc, "stock_cg_guarantee_cninfo")
+            self._record_field_status(
+                result,
+                "governance.guarantee_info",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_cg_guarantee_cninfo"],
+                note="担保数据采集失败。",
+            )
+
+        try:
+            df = self._akshare_call("stock_cg_lawsuit_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                governance.lawsuit_info = f"诉讼记录{len(df)}条"
+                self._record_field_status(
+                    result,
+                    "governance.lawsuit_info",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_cg_lawsuit_cninfo"],
+                )
+            else:
+                governance.lawsuit_info = "已核查无诉讼记录"
+                self._record_field_status(
+                    result,
+                    "governance.lawsuit_info",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_cg_lawsuit_cninfo"],
+                    note="已核查无诉讼记录。",
+                )
+        except Exception as exc:
+            self._log_failure("governance_lawsuit", "akshare", exc, "stock_cg_lawsuit_cninfo")
+            self._record_field_status(
+                result,
+                "governance.lawsuit_info",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_cg_lawsuit_cninfo"],
+                note="诉讼数据采集失败。",
+            )
+
+        try:
+            df = self._akshare_call("stock_hold_change_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                for _, row in df.head(10).iterrows():
+                    governance.management_changes.append(
+                        {
+                            "name": str(row.get("股东名称") or row.get("姓名") or row.iloc[0] if len(row) > 0 else ""),
+                            "change_type": str(row.get("变动方向") or row.get("增减持方向") or row.get("变动原因") or ""),
+                            "change_date": str(row.get("变动日期") or row.get("公告日期") or row.get("截止日期") or ""),
+                            "ratio": self._safe_float(row.get("变动比例") or row.get("持股比例") or row.get("占总股本比例")),
+                        }
+                    )
+                self._record_field_status(
+                    result,
+                    "governance.management_changes",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_hold_change_cninfo"],
+                )
+            else:
+                self._record_field_status(
+                    result,
+                    "governance.management_changes",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_hold_change_cninfo"],
+                    note="已核查无董监高增减持记录。",
+                )
+        except Exception as exc:
+            self._log_failure("governance_hold_change", "akshare", exc, "stock_hold_change_cninfo")
+            self._record_field_status(
+                result,
+                "governance.management_changes",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_hold_change_cninfo"],
+                note="董监高变动数据采集失败。",
+            )
+
+        official_events = result.compliance_events or []
+        if official_events and governance.lawsuit_info in ("", "已核查无诉讼记录"):
             titles = []
             for item in official_events[:3]:
                 if isinstance(item, ComplianceEvent):
@@ -2275,8 +3656,15 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                     title = str(item.get("title") or "").strip()
                 if title:
                     titles.append(title)
-            if titles and not governance.lawsuit_info:
+            if titles:
                 governance.lawsuit_info = f"官方公开合规事件{len(official_events)}条: {'；'.join(titles[:3])}"
+                self._record_field_status(
+                    result,
+                    "governance.lawsuit_info",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_cg_lawsuit_cninfo", "official_compliance"],
+                    note="诉讼信息由官方合规事件补强。",
+                )
         result.governance = governance
 
     @staticmethod
@@ -2310,6 +3698,13 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             )
         except Exception as exc:
             self._log_failure("compliance_events", "official_sources", exc, company_name or stock_code)
+            self._record_field_status(
+                result,
+                "compliance_events.latest",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["csrc", "credit_china", "national_enterprise_credit"],
+                note="官方合规事件采集失败。",
+            )
             return
 
         events: list[ComplianceEvent] = []
@@ -2340,7 +3735,22 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         result.compliance_events = events
         if events:
+            self._record_field_status(
+                result,
+                "compliance_events.latest",
+                value_state=FieldValueState.PRESENT,
+                sources_checked=sorted({item.source for item in events if item.source}),
+                reference_date=str(events[0].publish_date or ""),
+            )
             self._save_to_cache(cache_key, [item.model_dump() for item in events], ttl=86400 * 3)
+        else:
+            self._record_field_status(
+                result,
+                "compliance_events.latest",
+                value_state=FieldValueState.VERIFIED_ABSENT,
+                sources_checked=["csrc", "credit_china", "national_enterprise_credit"],
+                note="已核查官方合规来源，暂无记录。",
+            )
 
     def _get_shareholder_data(self, stock_code: str, result: CollectorOutput) -> None:
         """Collect shareholder structure and latest shareholder count."""
@@ -2359,10 +3769,31 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                             "report_date": str(self._coerce_date_value(row.get("截止日期")) or ""),
                         }
                     )
+                self._record_field_status(
+                    result,
+                    "shareholders.top_shareholders",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_circulate_stock_holder"],
+                )
+            else:
+                self._record_field_status(
+                    result,
+                    "shareholders.top_shareholders",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_circulate_stock_holder"],
+                    note="已核查无前十大流通股东记录。",
+                )
         except Exception as exc:
             self._log_failure("shareholders_top10", "akshare", exc, "stock_circulate_stock_holder")
+            self._record_field_status(
+                result,
+                "shareholders.top_shareholders",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_circulate_stock_holder"],
+                note="前十大股东采集失败。",
+            )
 
-        for quarter_end in self._quarter_end_candidates(count=2):
+        for quarter_end in self._quarter_end_candidates(count=4):
             try:
                 df = self._akshare_call("stock_hold_num_cninfo", date=quarter_end)
                 matched = self._filter_stock_rows(df, stock_code, ("证券代码",))
@@ -2371,10 +3802,71 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                 row = matched.iloc[0]
                 shareholders.shareholder_count = self._safe_int(row.get("本期股东人数"))
                 shareholders.shareholder_count_change = self._safe_float(row.get("股东人数增幅"))
+                self._record_field_status(
+                    result,
+                    "shareholders.shareholder_count",
+                    value_state=FieldValueState.PRESENT,
+                    sources_checked=["stock_hold_num_cninfo"],
+                    reference_date=quarter_end,
+                )
                 break
             except Exception as exc:
                 self.logger.debug(f"shareholders_count fallback skipped for {quarter_end}: {exc}")
                 continue
+        if shareholders.shareholder_count is None:
+            self._record_field_status(
+                result,
+                "shareholders.shareholder_count",
+                value_state=FieldValueState.VERIFIED_ABSENT,
+                sources_checked=["stock_hold_num_cninfo"],
+                note="已回溯多个季度，仍未找到股东户数。",
+            )
+
+        management_ratios: list[float] = []
+        try:
+            df = self._akshare_call("stock_hold_change_cninfo", symbol=stock_code)
+            if df is not None and not df.empty:
+                for column in df.columns:
+                    text = str(column)
+                    if any(token in text for token in ("持股比例", "占总股本比例", "变动比例")):
+                        for value in df[column].tolist():
+                            ratio = self._safe_float(value)
+                            if ratio is not None:
+                                management_ratios.append(ratio)
+                if management_ratios:
+                    shareholders.management_share_ratio = round(max(management_ratios), 4)
+                    self._record_field_status(
+                        result,
+                        "shareholders.management_share_ratio",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_hold_change_cninfo"],
+                        note="董监高持股比例暂用增减持披露中的最大持股比例近似。",
+                    )
+                else:
+                    self._record_field_status(
+                        result,
+                        "shareholders.management_share_ratio",
+                        value_state=FieldValueState.VERIFIED_ABSENT,
+                        sources_checked=["stock_hold_change_cninfo"],
+                        note="已核查增减持记录，但未发现稳定董监高持股比例字段。",
+                    )
+            else:
+                self._record_field_status(
+                    result,
+                    "shareholders.management_share_ratio",
+                    value_state=FieldValueState.VERIFIED_ABSENT,
+                    sources_checked=["stock_hold_change_cninfo"],
+                    note="已核查无董监高持股比例记录。",
+                )
+        except Exception as exc:
+            self._log_failure("shareholders_management_ratio", "akshare", exc, "stock_hold_change_cninfo")
+            self._record_field_status(
+                result,
+                "shareholders.management_share_ratio",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["stock_hold_change_cninfo"],
+                note="董监高持股比例采集失败。",
+            )
 
         result.shareholders = shareholders
 
@@ -2408,6 +3900,13 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             )
         except Exception as exc:
             self._log_failure("patents", "official_sources", exc, company_name or stock_code)
+            self._record_field_status(
+                result,
+                "patents.latest",
+                value_state=FieldValueState.COLLECTION_FAILED,
+                sources_checked=["cnipa"],
+                note="官方专利采集失败。",
+            )
             return
 
         patents: list[PatentRecord] = []
@@ -2443,7 +3942,22 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         result.patents = patents
         if patents:
+            self._record_field_status(
+                result,
+                "patents.latest",
+                value_state=FieldValueState.PRESENT,
+                sources_checked=sorted({item.source for item in patents if item.source}),
+                reference_date=str(patents[0].publish_date or ""),
+            )
             self._save_to_cache(cache_key, [item.model_dump() for item in patents], ttl=86400 * 3)
+        else:
+            self._record_field_status(
+                result,
+                "patents.latest",
+                value_state=FieldValueState.VERIFIED_ABSENT,
+                sources_checked=["cnipa"],
+                note="已核查官方专利来源，暂无记录。",
+            )
 
     def _get_sentiment_data(self, stock_code: str, result: CollectorOutput) -> None:
         """Derive sentiment counts from collected news."""
@@ -2569,7 +4083,22 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
 
         result.policy_documents = policy_documents
         if policy_documents:
+            self._record_field_status(
+                result,
+                "policy_documents.latest",
+                value_state=FieldValueState.PRESENT,
+                sources_checked=sorted({item.source for item in policy_documents if item.source}),
+                reference_date=str(policy_documents[0].policy_date or ""),
+            )
             self._save_to_cache(cache_key, [item.model_dump() for item in policy_documents], ttl=86400 * 3)
+        else:
+            self._record_field_status(
+                result,
+                "policy_documents.latest",
+                value_state=FieldValueState.VERIFIED_ABSENT,
+                sources_checked=["gov.cn"],
+                note="已核查政策来源，暂无匹配记录。",
+            )
 
     # ================================================================
     # 跨源填补
@@ -2582,9 +4111,11 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             structured = item.structured_fields if isinstance(item.structured_fields, dict) else {}
             stock_info = structured.get("stock_info") if isinstance(structured, dict) else None
             if isinstance(stock_info, dict):
-                main_business = str(stock_info.get("main_business") or "").strip()
-                if len(main_business) >= 12:
-                    return main_business[:180]
+                main_business = DataCollectorAgent._normalize_main_business_text(
+                    str(stock_info.get("main_business") or "").strip(),
+                )
+                if main_business:
+                    return main_business
 
         patterns = [
             r"(?:主营业务|公司主要从事|主要业务为|核心业务为)[:：]\s*([^。；\n]{12,220})",
@@ -2603,8 +4134,8 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             for pattern in patterns:
                 match = re.search(pattern, text)
                 if match:
-                    candidate = DataCollectorAgent._clean_text(match.group(1))[:180]
-                    if len(candidate) >= 12:
+                    candidate = DataCollectorAgent._normalize_main_business_text(match.group(1))
+                    if candidate:
                         return candidate
         return None
 
@@ -2638,13 +4169,13 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
     @staticmethod
     def _announcement_priority(item: Announcement) -> tuple[int, str]:
         text = f"{item.announcement_type} {item.title}"
-        if "骞存姤" in text or "骞村害鎶ュ憡" in text:
-            return 0, str(item.announcement_date or "")
-        if "鍗婂勾" in text or "鍗婂勾鎶?" in text or "涓湡鎶ュ憡" in text:
+        if "半年" in text or "半年报" in text or "中期报告" in text:
             return 1, str(item.announcement_date or "")
-        if "瀛ｅ害" in text or "瀛ｆ姤" in text:
+        if "季度" in text or "季报" in text:
             return 2, str(item.announcement_date or "")
-        if "闂" in text:
+        if "年报" in text or ("年度报告" in text and "半年度报告" not in text):
+            return 0, str(item.announcement_date or "")
+        if "问询" in text:
             return 4, str(item.announcement_date or "")
         return 3, str(item.announcement_date or "")
 
@@ -2657,18 +4188,28 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             return None
 
         updates: dict[str, Any] = {}
-        target_fields = ("main_business", "business_model", "asset_model", "client_type")
+        target_fields = ("main_business", "business_model", "asset_model", "client_type", "actual_controller")
+        current_main_business = str(stock_info.main_business or "").strip()
         for item in sorted(announcements, key=DataCollectorAgent._announcement_priority):
             structured = item.structured_fields if isinstance(item.structured_fields, dict) else {}
             structured_stock_info = structured.get("stock_info") if isinstance(structured, dict) else None
             if not isinstance(structured_stock_info, dict):
                 continue
             for field_name in target_fields:
+                value = str(structured_stock_info.get(field_name) or "").strip()
+                if not value:
+                    continue
+                if field_name == "main_business":
+                    if updates.get(field_name):
+                        continue
+                    if current_main_business and not DataCollectorAgent._looks_like_business_scope_text(current_main_business):
+                        continue
+                    updates[field_name] = value[:240]
+                    current_main_business = updates[field_name]
+                    continue
                 if updates.get(field_name) or getattr(stock_info, field_name):
                     continue
-                value = str(structured_stock_info.get(field_name) or "").strip()
-                if value:
-                    updates[field_name] = value[:240]
+                updates[field_name] = value[:240]
 
         return stock_info.model_copy(update=updates) if updates else stock_info
 
@@ -2703,15 +4244,23 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             if report_date is None:
                 continue
 
+            # Announcement/PDF cashflow snippets are too noisy for core statements.
             normalized_snapshot = {
                 key: value
                 for key, value in snapshot.items()
-                if key in allowed_fields and value not in (None, "", [], {})
+                if (
+                    key in allowed_fields
+                    and key not in DataCollectorAgent._ANNOUNCEMENT_EVIDENCE_ONLY_FINANCIAL_FIELDS
+                    and value not in (None, "", [], {})
+                )
             }
             extra_snapshot = {
                 key: value
                 for key, value in snapshot.items()
-                if key not in normalized_snapshot and value not in (None, "", [], {})
+                if (
+                    key not in normalized_snapshot
+                    and value not in (None, "", [], {})
+                )
             }
             if not normalized_snapshot and not extra_snapshot:
                 continue
@@ -2719,20 +4268,31 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             report_date_key = report_date.strftime("%Y-%m-%d")
             if report_date_key in index_by_date:
                 existing = merged[index_by_date[report_date_key]]
-                updates = {
+                used_snapshot = {
                     key: value
                     for key, value in normalized_snapshot.items()
                     if getattr(existing, key, None) in (None, "", [], {})
                 }
+                updates = dict(used_snapshot)
                 raw_data = dict(existing.raw_data or {})
                 if extra_snapshot:
                     extracts = list(raw_data.get("announcement_extracts") or [])
                     extracts.append({"title": item.title, "snapshot": extra_snapshot})
                     raw_data["announcement_extracts"] = extracts[-5:]
+                raw_data = DataCollectorAgent._merge_source_values(
+                    raw_data,
+                    source_name="cninfo_announcement_extract",
+                    metrics=used_snapshot,
+                    source_type="self_reported",
+                    reference_date=report_date_key,
+                )
                 if raw_data != (existing.raw_data or {}):
                     updates["raw_data"] = raw_data
                 if updates:
                     merged[index_by_date[report_date_key]] = existing.model_copy(update=updates)
+                continue
+
+            if not normalized_snapshot:
                 continue
 
             merged.append(
@@ -2741,7 +4301,13 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
                     report_date=report_date,
                     report_type=item.announcement_type or "announcement_extract",
                     source=DataSource.CNINFO,
-                    raw_data={"announcement_title": item.title, "announcement_snapshot_extra": extra_snapshot},
+                    raw_data=DataCollectorAgent._merge_source_values(
+                        {"announcement_title": item.title, "announcement_snapshot_extra": extra_snapshot},
+                        source_name="cninfo_announcement_extract",
+                        metrics=normalized_snapshot,
+                        source_type="self_reported",
+                        reference_date=report_date_key,
+                    ),
                     **normalized_snapshot,
                 )
             )
@@ -2751,6 +4317,85 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         return merged
 
     @staticmethod
+    def _prune_source_metrics(
+        source_values: dict[str, Any],
+        source_name: str,
+        metric_names: set[str],
+    ) -> bool:
+        payload = dict(source_values.get(source_name) or {})
+        metrics = dict(payload.get("metrics") or {})
+        changed = False
+        for metric_name in metric_names:
+            if metric_name in metrics:
+                metrics.pop(metric_name, None)
+                changed = True
+        if not changed:
+            return False
+        if metrics:
+            payload["metrics"] = metrics
+            source_values[source_name] = payload
+        else:
+            source_values.pop(source_name, None)
+        return True
+
+    @staticmethod
+    def _prune_conflicting_financial_source_values(
+        financials: list[FinancialStatement],
+    ) -> list[FinancialStatement]:
+        cleaned: list[FinancialStatement] = []
+        for item in financials:
+            raw_data = dict(item.raw_data or {})
+            source_values = dict(raw_data.get("source_values") or {})
+            if not source_values:
+                cleaned.append(item)
+                continue
+
+            changed = False
+            strong_profit_metrics: set[str] = set()
+            strong_balance_metrics: set[str] = set()
+            for source_name in ("akshare_financial_abstract", "eastmoney_profit"):
+                metrics = dict(dict(source_values.get(source_name) or {}).get("metrics") or {})
+                strong_profit_metrics.update(
+                    key for key in ("revenue", "net_profit", "deduct_net_profit") if metrics.get(key) is not None
+                )
+            for source_name in ("eastmoney_balance",):
+                metrics = dict(dict(source_values.get(source_name) or {}).get("metrics") or {})
+                strong_balance_metrics.update(
+                    key
+                    for key in ("contract_liabilities", "equity", "total_assets", "total_liabilities", "goodwill_ratio")
+                    if metrics.get(key) is not None
+                )
+
+            if strong_profit_metrics:
+                changed |= DataCollectorAgent._prune_source_metrics(
+                    source_values,
+                    "baostock_financials",
+                    strong_profit_metrics & {"revenue", "net_profit"},
+                )
+                changed |= DataCollectorAgent._prune_source_metrics(
+                    source_values,
+                    "cninfo_announcement_extract",
+                    strong_profit_metrics & {"revenue", "net_profit", "deduct_net_profit"},
+                )
+            if strong_balance_metrics:
+                changed |= DataCollectorAgent._prune_source_metrics(
+                    source_values,
+                    "cninfo_announcement_extract",
+                    strong_balance_metrics,
+                )
+
+            if not changed:
+                cleaned.append(item)
+                continue
+
+            if source_values:
+                raw_data["source_values"] = source_values
+            else:
+                raw_data.pop("source_values", None)
+            cleaned.append(item.model_copy(update={"raw_data": raw_data}))
+        return cleaned
+
+    @staticmethod
     def _merge_structured_governance(
         governance: GovernanceData | None,
         announcements: list[Announcement],
@@ -2758,11 +4403,31 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         if governance is None or not announcements:
             return governance
 
+        updates: dict[str, Any] = {}
         dividend_history = list(governance.dividend_history or [])
         seen_titles = {str(item.get("title") or "") for item in dividend_history if isinstance(item, dict)}
 
         for item in sorted(announcements, key=DataCollectorAgent._announcement_priority):
             structured = item.structured_fields if isinstance(item.structured_fields, dict) else {}
+            structured_governance = structured.get("governance") if isinstance(structured, dict) else None
+            if isinstance(structured_governance, dict):
+                for field_name in (
+                    "actual_controller",
+                    "pledge_details",
+                    "equity_pledge_ratio",
+                    "guarantee_info",
+                    "lawsuit_info",
+                ):
+                    current_value = updates.get(field_name, getattr(governance, field_name, None))
+                    if current_value not in (None, "", [], {}):
+                        continue
+                    value = structured_governance.get(field_name)
+                    if value not in (None, "", [], {}):
+                        updates[field_name] = value
+                if not (updates.get("management_changes") or governance.management_changes):
+                    changes = structured_governance.get("management_changes")
+                    if isinstance(changes, list) and changes:
+                        updates["management_changes"] = changes[:10]
             dividend_plan = str(structured.get("dividend_plan") or "").strip() if isinstance(structured, dict) else ""
             if not dividend_plan or item.title in seen_titles:
                 continue
@@ -2777,7 +4442,150 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             )
             seen_titles.add(item.title)
 
-        return governance.model_copy(update={"dividend_history": dividend_history[:10]}) if dividend_history else governance
+        if dividend_history:
+            updates["dividend_history"] = dividend_history[:10]
+
+        return governance.model_copy(update=updates) if updates else governance
+
+    @staticmethod
+    def _merge_structured_shareholders(
+        shareholders: ShareholderData | None,
+        announcements: list[Announcement],
+    ) -> ShareholderData | None:
+        if not announcements:
+            return shareholders
+
+        updates: dict[str, Any] = {}
+        current_ratio = shareholders.management_share_ratio if shareholders is not None else None
+        for item in sorted(announcements, key=DataCollectorAgent._announcement_priority):
+            structured = item.structured_fields if isinstance(item.structured_fields, dict) else {}
+            structured_shareholders = structured.get("shareholders") if isinstance(structured, dict) else None
+            if not isinstance(structured_shareholders, dict):
+                continue
+            if updates.get("management_share_ratio") is None and current_ratio is None:
+                ratio = DataCollectorAgent._safe_float(structured_shareholders.get("management_share_ratio"))
+                if ratio is not None:
+                    updates["management_share_ratio"] = ratio
+        if shareholders is None:
+            return ShareholderData(**updates) if updates else None
+        return shareholders.model_copy(update=updates) if updates else shareholders
+
+    @staticmethod
+    def _structured_announcement_source_name(item: Announcement) -> str:
+        return "annual_report_text" if item.announcement_type in {"年报", "半年报", "三季报", "一季报"} else "announcement"
+
+    @staticmethod
+    def _collect_structured_governance_statuses(
+        announcements: list[Announcement],
+    ) -> dict[str, tuple[FieldValueState, list[str], str]]:
+        statuses: dict[str, tuple[FieldValueState, list[str], str]] = {}
+        for item in sorted(announcements, key=DataCollectorAgent._announcement_priority):
+            structured = item.structured_fields if isinstance(item.structured_fields, dict) else {}
+            source_name = DataCollectorAgent._structured_announcement_source_name(item)
+            structured_governance = structured.get("governance") if isinstance(structured, dict) else None
+            if isinstance(structured_governance, dict):
+                if structured_governance.get("actual_controller") and "governance.actual_controller" not in statuses:
+                    statuses["governance.actual_controller"] = (
+                        FieldValueState.PRESENT,
+                        [source_name],
+                        "实控人由年报/公告结构化文本补强。",
+                    )
+                if structured_governance.get("equity_pledge_ratio") is not None and "governance.equity_pledge_ratio" not in statuses:
+                    statuses["governance.equity_pledge_ratio"] = (
+                        FieldValueState.PRESENT,
+                        [source_name],
+                        "已从年报/公告识别股权质押比例。",
+                    )
+                elif structured_governance.get("equity_pledge_absent") and "governance.equity_pledge_ratio" not in statuses:
+                    statuses["governance.equity_pledge_ratio"] = (
+                        FieldValueState.VERIFIED_ABSENT,
+                        [source_name],
+                        "已核查年报/公告质押章节，未见稳定质押记录。",
+                    )
+                if structured_governance.get("guarantee_info") and "governance.guarantee_info" not in statuses:
+                    statuses["governance.guarantee_info"] = (
+                        FieldValueState.VERIFIED_ABSENT if structured_governance.get("guarantee_absent") else FieldValueState.PRESENT,
+                        [source_name],
+                        "担保信息由年报/公告文本补强。",
+                    )
+                if structured_governance.get("lawsuit_info") and "governance.lawsuit_info" not in statuses:
+                    statuses["governance.lawsuit_info"] = (
+                        FieldValueState.VERIFIED_ABSENT if structured_governance.get("lawsuit_absent") else FieldValueState.PRESENT,
+                        [source_name],
+                        "诉讼信息由年报/公告文本补强。",
+                    )
+                if structured_governance.get("management_changes") and "governance.management_changes" not in statuses:
+                    statuses["governance.management_changes"] = (
+                        FieldValueState.PRESENT,
+                        [source_name],
+                        "董监高变动由年报/公告文本补强。",
+                    )
+                elif structured_governance.get("management_changes_absent") and "governance.management_changes" not in statuses:
+                    statuses["governance.management_changes"] = (
+                        FieldValueState.VERIFIED_ABSENT,
+                        [source_name],
+                        "已核查年报/公告董监高变动章节，未见稳定变动记录。",
+                    )
+
+            structured_shareholders = structured.get("shareholders") if isinstance(structured, dict) else None
+            if isinstance(structured_shareholders, dict):
+                if structured_shareholders.get("management_share_ratio") is not None and "shareholders.management_share_ratio" not in statuses:
+                    statuses["shareholders.management_share_ratio"] = (
+                        FieldValueState.PRESENT,
+                        [source_name],
+                        "董监高持股比例由年报/公告文本补强。",
+                    )
+                elif structured_shareholders.get("management_share_ratio_absent") and "shareholders.management_share_ratio" not in statuses:
+                    statuses["shareholders.management_share_ratio"] = (
+                        FieldValueState.VERIFIED_ABSENT,
+                        [source_name],
+                        "已核查年报/公告董监高持股章节，未见持股比例披露。",
+                    )
+
+        return statuses
+
+    @staticmethod
+    def _apply_backfill_status_if_stronger(
+        result: CollectorOutput,
+        field_name: str,
+        value_state: FieldValueState,
+        *,
+        sources_checked: list[str],
+        note: str = "",
+    ) -> None:
+        existing = dict(result.field_statuses or {}).get(field_name)
+        if existing is not None:
+            if value_state == FieldValueState.PRESENT and existing.value_state == FieldValueState.PRESENT:
+                return
+            if value_state == FieldValueState.VERIFIED_ABSENT and existing.value_state not in {
+                FieldValueState.COLLECTION_FAILED,
+                FieldValueState.MISSING,
+            }:
+                return
+        DataCollectorAgent._record_field_status(
+            result,
+            field_name,
+            value_state=value_state,
+            sources_checked=sources_checked,
+            note=note,
+        )
+
+    @staticmethod
+    def _record_industry_enhanced_statuses(result: CollectorOutput, enhanced: IndustryEnhancedData) -> None:
+        DataCollectorAgent._record_field_status(
+            result,
+            "industry_enhanced.data_points",
+            value_state=FieldValueState.PRESENT if enhanced.data_points else FieldValueState.VERIFIED_ABSENT,
+            sources_checked=["industry_board_info"],
+            note="行业高频数据点待后续同行验证继续补强。" if enhanced.data_points else "已核查但暂未形成有效行业数据点。",
+        )
+        DataCollectorAgent._record_field_status(
+            result,
+            "industry_enhanced.industry_leaders",
+            value_state=FieldValueState.PRESENT if enhanced.industry_leaders else FieldValueState.VERIFIED_ABSENT,
+            sources_checked=["industry_board_info"],
+            note="行业龙头优先由同行交叉验证补强。" if not enhanced.industry_leaders else "",
+        )
 
     @staticmethod
     def _enrich_financial_statements(financials: list[FinancialStatement]) -> list[FinancialStatement]:
@@ -2785,27 +4593,152 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
         enriched: list[FinancialStatement] = []
         for item in financials:
             updates: dict[str, Any] = {}
-            if item.free_cashflow is None and item.operating_cashflow is not None and item.investing_cashflow is not None:
-                updates["free_cashflow"] = round(item.operating_cashflow + item.investing_cashflow, 2)
+            raw_data = dict(item.raw_data or {})
+            capital_expenditure = DataCollectorAgent._safe_float(raw_data.get("capital_expenditure"))
+            derived_free_cashflow = DataCollectorAgent._derive_free_cashflow(
+                item.operating_cashflow,
+                capital_expenditure,
+                item.investing_cashflow,
+            )
+            if item.free_cashflow is None and derived_free_cashflow is not None:
+                updates["free_cashflow"] = derived_free_cashflow
             if item.cash_to_profit is None and item.operating_cashflow is not None and item.net_profit not in (None, 0):
                 updates["cash_to_profit"] = round(item.operating_cashflow / item.net_profit, 2)
             enriched.append(item.model_copy(update=updates) if updates else item)
         return enriched
 
+    @staticmethod
+    def _has_substantive_financial_statement(item: FinancialStatement) -> bool:
+        return any(
+            getattr(item, field, None) is not None
+            for field in (
+                "revenue",
+                "net_profit",
+                "operating_cashflow",
+                "equity",
+                "total_assets",
+                "total_liabilities",
+                "gross_margin",
+                "roe",
+                "goodwill_ratio",
+                "non_recurring_profit",
+                "contract_liabilities",
+            )
+        )
+
+    @staticmethod
+    def _prune_non_substantive_financials(financials: list[FinancialStatement]) -> list[FinancialStatement]:
+        """Drop synthetic placeholder rows that only carry a date but no usable financial content."""
+        pruned: list[FinancialStatement] = []
+        for item in financials:
+            if DataCollectorAgent._has_substantive_financial_statement(item):
+                pruned.append(item)
+                continue
+            if item.source != DataSource.CNINFO:
+                pruned.append(item)
+        return pruned
+
+    @staticmethod
+    def _latest_substantive_financial(financials: list[FinancialStatement]) -> FinancialStatement | None:
+        """Return the latest financial statement with substantive core fields."""
+        for item in financials:
+            if DataCollectorAgent._has_substantive_financial_statement(item):
+                return item
+        return financials[0] if financials else None
+
+    @staticmethod
+    def _backfill_financial_totals_from_per_share(financials: list[FinancialStatement]) -> list[FinancialStatement]:
+        """Use per-share metrics plus total shares to restore total cashflow/equity/asset fields."""
+        restored: list[FinancialStatement] = []
+        for item in financials:
+            raw_data = dict(item.raw_data or {})
+            total_share = DataCollectorAgent._safe_float(raw_data.get("total_share"))
+            book_value_per_share = DataCollectorAgent._safe_float(raw_data.get("book_value_per_share"))
+            operating_cashflow_per_share = DataCollectorAgent._safe_float(raw_data.get("operating_cashflow_per_share"))
+            asset_to_equity = DataCollectorAgent._safe_float(raw_data.get("asset_to_equity"))
+
+            updates: dict[str, Any] = {}
+            if total_share and item.equity is None and book_value_per_share is not None:
+                updates["equity"] = round(book_value_per_share * total_share, 2)
+            if total_share and item.operating_cashflow is None and operating_cashflow_per_share is not None:
+                updates["operating_cashflow"] = round(operating_cashflow_per_share * total_share, 2)
+
+            derived_equity = updates.get("equity", item.equity)
+            if derived_equity is not None and item.total_assets is None and asset_to_equity and asset_to_equity > 1:
+                updates["total_assets"] = round(derived_equity * asset_to_equity, 2)
+
+            derived_assets = updates.get("total_assets", item.total_assets)
+            if derived_assets is not None and item.total_liabilities is None:
+                debt_ratio = item.debt_ratio
+                if debt_ratio is not None:
+                    updates["total_liabilities"] = round(derived_assets * debt_ratio / 100, 2)
+
+            if updates:
+                raw_data = DataCollectorAgent._merge_source_values(
+                    raw_data,
+                    source_name="derived_per_share",
+                    metrics={
+                        "equity": updates.get("equity"),
+                        "operating_cashflow": updates.get("operating_cashflow"),
+                        "total_assets": updates.get("total_assets"),
+                        "total_liabilities": updates.get("total_liabilities"),
+                    },
+                    source_type="derived",
+                    reference_date=item.report_date.isoformat() if item.report_date else "",
+                )
+                updates["raw_data"] = raw_data
+            restored.append(item.model_copy(update=updates) if updates else item)
+        return restored
+
+    @staticmethod
+    def _backfill_realtime_valuation_from_financials(result: CollectorOutput) -> None:
+        """Fill market cap / PE / PB from latest substantive financials when quote source misses them."""
+        if not result.realtime or result.realtime.close in (None, 0) or not result.financials:
+            return
+
+        latest = DataCollectorAgent._latest_substantive_financial(result.financials)
+        if latest is None:
+            return
+
+        raw_data = dict(latest.raw_data or {})
+        total_share = DataCollectorAgent._safe_float(raw_data.get("total_share"))
+        eps_ttm = DataCollectorAgent._safe_float(raw_data.get("eps_ttm"))
+        if eps_ttm is None and latest.net_profit not in (None, 0) and total_share not in (None, 0):
+            eps_ttm = round(float(latest.net_profit) / float(total_share), 6)
+
+        book_value_per_share = DataCollectorAgent._safe_float(raw_data.get("book_value_per_share"))
+        if book_value_per_share is None and latest.equity not in (None, 0) and total_share not in (None, 0):
+            book_value_per_share = round(float(latest.equity) / float(total_share), 6)
+
+        close = float(result.realtime.close)
+        updates: dict[str, Any] = {}
+        derived_metrics = {
+            "market_cap": round(close * float(total_share), 2) if total_share not in (None, 0) else None,
+            "pe_ttm": round(close / float(eps_ttm), 6) if eps_ttm not in (None, 0) else None,
+            "pb_mrq": round(close / float(book_value_per_share), 6) if book_value_per_share not in (None, 0) else None,
+        }
+        if result.realtime.market_cap is None and total_share not in (None, 0):
+            updates["market_cap"] = derived_metrics["market_cap"]
+        if result.realtime.pe_ttm is None and eps_ttm not in (None, 0):
+            updates["pe_ttm"] = derived_metrics["pe_ttm"]
+        if result.realtime.pb_mrq is None and book_value_per_share not in (None, 0):
+            updates["pb_mrq"] = derived_metrics["pb_mrq"]
+
+        realtime_raw_data = DataCollectorAgent._merge_source_values(
+            dict(result.realtime.raw_data or {}),
+            source_name="derived_realtime_from_financials",
+            metrics=derived_metrics,
+            source_type="derived",
+            reference_date=latest.report_date.isoformat() if latest.report_date else "",
+        )
+        if realtime_raw_data:
+            updates["raw_data"] = realtime_raw_data
+
+        if updates:
+            result.realtime = result.realtime.model_copy(update=updates)
+
     def _fill_missing_fields(self, stock_code: str, result: CollectorOutput) -> None:
         """Cross-source backfill for lightweight but useful fields."""
-        if (not result.valuation or len(result.valuation) == 0) and result.realtime:
-            rt = result.realtime
-            if rt.pe_ttm is not None or rt.pb_mrq is not None:
-                result.valuation = [
-                    StockPrice(
-                        code=stock_code,
-                        date=date.today(),
-                        pe_ttm=rt.pe_ttm,
-                        pb_mrq=rt.pb_mrq,
-                    )
-                ]
-
         if (not result.governance or not self._has_substantive_model_data(result.governance)) and result.stock_info:
             top_holder_name = ""
             if result.shareholders and result.shareholders.top_shareholders:
@@ -2828,7 +4761,9 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             )
 
         if result.financials:
+            result.financials = self._prune_non_substantive_financials(result.financials)
             result.financials = self._enrich_financial_statements(result.financials)
+            result.financials = self._backfill_financial_totals_from_per_share(result.financials)
 
         if result.announcements:
             if result.stock_info:
@@ -2836,15 +4771,68 @@ class DataCollectorAgent(AgentBase[AgentInput, AgentOutput]):
             result.financials = self._merge_structured_financials(stock_code, result.financials, result.announcements)
             if result.governance:
                 result.governance = self._merge_structured_governance(result.governance, result.announcements)
+            result.shareholders = self._merge_structured_shareholders(result.shareholders, result.announcements)
             if result.financials:
+                result.financials = self._prune_non_substantive_financials(result.financials)
                 result.financials = self._enrich_financial_statements(result.financials)
+                result.financials = self._backfill_financial_totals_from_per_share(result.financials)
+
+        if result.financials:
+            result.financials = self._prune_conflicting_financial_source_values(result.financials)
+
+        self._backfill_realtime_valuation_from_financials(result)
+
+        if (not result.valuation or len(result.valuation) == 0) and result.realtime:
+            rt = result.realtime
+            if rt.pe_ttm is not None or rt.pb_mrq is not None:
+                result.valuation = [
+                    StockPrice(
+                        code=stock_code,
+                        date=date.today(),
+                        pe_ttm=rt.pe_ttm,
+                        pb_mrq=rt.pb_mrq,
+                    )
+                ]
 
         if result.stock_info and not result.stock_info.main_business and result.announcements:
             main_business = self._extract_main_business_from_announcements(result.announcements)
             if main_business:
                 result.stock_info = result.stock_info.model_copy(update={"main_business": main_business})
 
+        if result.stock_info:
+            if result.governance and result.governance.actual_controller:
+                actual_controller_sources = (
+                    ["stock_info"]
+                    if result.stock_info.actual_controller == result.governance.actual_controller
+                    else ["annual_report_text"]
+                )
+                self._apply_backfill_status_if_stronger(
+                    result,
+                    "governance.actual_controller",
+                    FieldValueState.PRESENT,
+                    sources_checked=actual_controller_sources,
+                    note="实控人由基础资料或公告结构化结果补齐。",
+                )
+            for field_name in ("main_business", "business_model", "asset_model", "client_type"):
+                if getattr(result.stock_info, field_name, None):
+                    self._record_field_status(
+                        result,
+                        f"stock_info.{field_name}",
+                        value_state=FieldValueState.PRESENT,
+                        sources_checked=["stock_info", "announcements"],
+                    )
+
         if result.announcements:
+            for field_name, (value_state, sources_checked, note) in self._collect_structured_governance_statuses(
+                result.announcements
+            ).items():
+                self._apply_backfill_status_if_stronger(
+                    result,
+                    field_name,
+                    value_state,
+                    sources_checked=sources_checked,
+                    note=note,
+                )
             dividend_history, buyback_history, refinancing_history = self._derive_governance_histories_from_announcements(
                 result.announcements
             )

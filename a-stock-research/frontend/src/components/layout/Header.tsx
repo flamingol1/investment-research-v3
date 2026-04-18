@@ -40,14 +40,15 @@ const Header: React.FC = () => {
       <div className="flex items-center gap-3">
         <button
           onClick={toggleSidebar}
-          className="text-gray-400 hover:text-gray-200 text-lg p-1"
+          className="text-lg p-1 rounded transition-colors"
+          style={{ color: 'var(--color-text-secondary)' }}
         >
           {sidebarCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
         </button>
 
         <Input
           placeholder="输入股票代码或搜索关键词..."
-          prefix={<SearchOutlined className="text-gray-500" />}
+          prefix={<SearchOutlined style={{ color: 'var(--color-text-muted)' }} />}
           value={searchValue}
           onChange={(e) => setSearchValue(e.target.value)}
           onPressEnter={() => handleSearch(searchValue)}
@@ -60,7 +61,8 @@ const Header: React.FC = () => {
         <Tooltip title={theme === 'dark' ? '切换亮色' : '切换暗色'}>
           <button
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            className="text-gray-400 hover:text-gray-200 text-lg p-2 rounded-lg hover:bg-white/5"
+            className="text-lg p-2 rounded-lg transition-colors"
+            style={{ color: 'var(--color-text-secondary)' }}
           >
             {theme === 'dark' ? <BulbOutlined /> : <BulbFilled />}
           </button>

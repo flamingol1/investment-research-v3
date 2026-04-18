@@ -84,6 +84,51 @@ class MonitoringLayer(str, Enum):
     RISK_TRIGGER = "risk_trigger"
 
 
+class FieldValueState(str, Enum):
+    """字段值状态，明确区分空值背后的原因。"""
+
+    PRESENT = "present"
+    VERIFIED_ABSENT = "verified_absent"
+    COLLECTION_FAILED = "collection_failed"
+    NOT_APPLICABLE = "not_applicable"
+    MISSING = "missing"
+
+
+class FieldEvidenceState(str, Enum):
+    """字段证据状态。"""
+
+    CONSISTENT = "consistent"
+    SINGLE_SOURCE = "single_source"
+    INSUFFICIENT = "insufficient"
+    DIVERGENT = "divergent"
+    VERIFIED_ABSENT = "verified_absent"
+    COLLECTION_FAILED = "collection_failed"
+    NOT_APPLICABLE = "not_applicable"
+    UNKNOWN = "unknown"
+
+
+class FieldPeriodType(str, Enum):
+    """字段口径/观察周期。"""
+
+    INSTANT = "instant"
+    LATEST = "latest"
+    QUARTER = "quarter"
+    CUMULATIVE = "cumulative"
+    TTM = "ttm"
+    ANNUAL = "annual"
+    EVENT = "event"
+    ROLLING = "rolling"
+
+
+class BlockingLevel(str, Enum):
+    """字段在深度研究中的阻断级别。"""
+
+    NONE = "none"
+    WARNING = "warning"
+    CORE = "core"
+    CRITICAL = "critical"
+
+
 # ============================================================
 # 通用证据/数据质量模型
 # ============================================================
@@ -108,6 +153,95 @@ class ModuleQualityProfile(BaseModel):
     source_priority: list[str] = Field(default_factory=list, description="已使用的来源优先级顺序")
     evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="关键证据引用")
     notes: list[str] = Field(default_factory=list, description="模块说明")
+
+
+class FieldContract(BaseModel):
+    """字段级质量契约。"""
+
+    field: str = Field(description="字段路径")
+    label: str = Field(default="", description="展示名称")
+    allowed_sources: list[str] = Field(default_factory=list, description="允许来源")
+    unit: str = Field(default="", description="标准单位")
+    period_type: FieldPeriodType = Field(default=FieldPeriodType.LATEST, description="标准口径")
+    blocking_level: BlockingLevel = Field(default=BlockingLevel.NONE, description="阻断级别")
+    notes: str = Field(default="", description="补充说明")
+
+
+class FieldSourceValue(BaseModel):
+    """字段来自单一来源的一次观测。"""
+
+    source_name: str = Field(default="", description="来源名称")
+    source_type: str = Field(default="", description="来源类型")
+    reference_date: str = Field(default="", description="来源日期")
+    value: Any = Field(default=None, description="原始观测值")
+    unit: str = Field(default="", description="单位")
+    period_type: str = Field(default="", description="口径")
+    excerpt: str = Field(default="", description="证据摘录")
+
+
+class FieldCollectionStatus(BaseModel):
+    """采集阶段记录的字段状态。"""
+
+    field: str = Field(default="", description="字段路径")
+    value_state: FieldValueState = Field(default=FieldValueState.MISSING, description="字段值状态")
+    sources_checked: list[str] = Field(default_factory=list, description="已检查来源")
+    reference_date: str = Field(default="", description="核查日期")
+    note: str = Field(default="", description="补充说明")
+
+
+class FieldQualityTrace(BaseModel):
+    """字段级追踪结果。"""
+
+    field: str = Field(description="字段路径")
+    label: str = Field(default="", description="展示名称")
+    value: Any = Field(default=None, description="规范化后的字段值")
+    allowed_sources: list[str] = Field(default_factory=list, description="允许来源")
+    unit: str = Field(default="", description="标准单位")
+    period_type: FieldPeriodType = Field(default=FieldPeriodType.LATEST, description="标准口径")
+    blocking_level: BlockingLevel = Field(default=BlockingLevel.NONE, description="阻断级别")
+    report_period: str = Field(default="", description="报告期/事件日期")
+    value_state: FieldValueState = Field(default=FieldValueState.MISSING, description="字段值状态")
+    evidence_state: FieldEvidenceState = Field(default=FieldEvidenceState.UNKNOWN, description="字段证据状态")
+    source_count: int = Field(default=0, description="有效来源数")
+    confidence_score: float = Field(default=0.0, ge=0, le=1, description="字段置信度")
+    source_values: list[FieldSourceValue] = Field(default_factory=list, description="来源观测")
+    notes: list[str] = Field(default_factory=list, description="附加说明")
+
+
+class QualityGateDecision(BaseModel):
+    """核心证据双闸门结果。"""
+
+    blocked: bool = Field(default=False, description="是否阻断")
+    gate_type: str = Field(default="dual_gate", description="闸门类型")
+    core_evidence_score: float = Field(default=0.0, ge=0, le=1, description="核心证据分")
+    blocking_fields: list[str] = Field(default_factory=list, description="阻断字段")
+    weak_fields: list[str] = Field(default_factory=list, description="弱证据字段")
+    reasons: list[str] = Field(default_factory=list, description="阻断/提示原因")
+    consistency_notes: list[str] = Field(default_factory=list, description="流程一致性说明")
+    coverage_ratio: float = Field(default=0.0, ge=0, le=1, description="覆盖率")
+    company_cross_confidence: float = Field(default=0.0, ge=0, le=1, description="公司交叉验证置信度")
+    peer_verified: int = Field(default=0, description="同业验证指标数")
+
+
+class RegressionBaselineSnapshot(BaseModel):
+    """每次运行输出的结构化基线。"""
+
+    stock_code: str = Field(default="", description="股票代码")
+    stock_name: str = Field(default="", description="股票名称")
+    depth: str = Field(default="standard", description="研究深度")
+    generated_at: datetime = Field(default_factory=datetime.now, description="生成时间")
+    coverage_ratio: float = Field(default=0.0, ge=0, le=1, description="覆盖率")
+    completeness: float = Field(default=0.0, ge=0, le=1, description="完整度")
+    core_evidence_score: float = Field(default=0.0, ge=0, le=1, description="核心证据分")
+    missing_fields: list[str] = Field(default_factory=list, description="缺失字段")
+    blocking_fields: list[str] = Field(default_factory=list, description="阻断字段")
+    divergent_fields: list[str] = Field(default_factory=list, description="分歧字段")
+    warning_count: int = Field(default=0, description="告警数")
+    initial_verdict: str = Field(default="", description="初筛结论")
+    final_recommendation: str = Field(default="", description="最终结论")
+    quality_gate_blocked: bool = Field(default=False, description="是否触发闸门")
+    quality_gate_reasons: list[str] = Field(default_factory=list, description="闸门原因")
+    consistency_notes: list[str] = Field(default_factory=list, description="流程一致性说明")
 
 
 class MonitoringPlanItem(BaseModel):
@@ -185,6 +319,7 @@ class StockPrice(BaseModel):
     pb_mrq: float | None = None
     ps_ttm: float | None = None
     market_cap: float | None = None
+    raw_data: dict[str, Any] | None = Field(default=None, description="鍘熷鏁版嵁JSON")
 
 
 class FinancialStatement(BaseModel):
@@ -273,11 +408,17 @@ class CollectorOutput(BaseModel):
     compliance_events: list[ComplianceEvent] = Field(default_factory=list, description="官方合规/监管事件")
     patents: list[PatentRecord] = Field(default_factory=list, description="官方专利/技术资料")
 
+    cross_verification: DataCrossVerification | None = Field(default=None, description="澶氭簮浜ゅ弶楠岃瘉缁撴灉")
+
     collection_status: dict[str, str] = Field(
         default_factory=dict,
         description="采集状态: data_type -> ok/partial/failed",
     )
     module_profiles: dict[str, ModuleQualityProfile] = Field(default_factory=dict, description="模块数据质量画像")
+    field_contracts: dict[str, FieldContract] = Field(default_factory=dict, description="字段级质量契约")
+    field_statuses: dict[str, FieldCollectionStatus] = Field(default_factory=dict, description="字段采集状态")
+    field_quality: dict[str, FieldQualityTrace] = Field(default_factory=dict, description="字段质量追踪")
+    quality_gate: QualityGateDecision | None = Field(default=None, description="双闸门结果")
     status: DataQualityStatus = Field(default=DataQualityStatus.PARTIAL, description="整体数据状态")
     completeness: float = Field(default=0.0, ge=0, le=1, description="整体关键字段完整度")
     missing_fields: list[str] = Field(default_factory=list, description="整体关键缺失字段")
@@ -301,6 +442,20 @@ class AgentInput(BaseModel):
     depth: str = Field(default="standard", description="分析深度: quick/standard/deep")
 
 
+class AgentExecutionRecord(BaseModel):
+    """Normalized runtime metadata for one agent execution."""
+
+    agent_name: str = Field(description="Agent name")
+    status: str = Field(default="", description="success/failed")
+    execution_mode: str = Field(default="deterministic", description="deterministic/llm/hybrid")
+    configured_model: str | None = Field(default=None, description="Configured model alias if present")
+    model_used: str | None = Field(default=None, description="Model alias requested at runtime")
+    llm_invoked: bool = Field(default=False, description="Whether an LLM call was attempted")
+    summary: str = Field(default="", description="Execution summary")
+    confidence: float | None = Field(default=None, description="Agent confidence")
+    errors: list[str] = Field(default_factory=list, description="Execution errors")
+
+
 class AgentOutput(BaseModel):
     """通用Agent输出"""
     agent_name: str = Field(description="Agent名称")
@@ -310,6 +465,10 @@ class AgentOutput(BaseModel):
     data_sources: list[str] = Field(default_factory=list, description="数据来源")
     confidence: float = Field(ge=0, le=1, default=0.5, description="置信度")
     summary: str = Field(default="", description="结论摘要")
+    execution_mode: str = Field(default="", description="Actual execution mode")
+    configured_model: str | None = Field(default=None, description="Configured model alias")
+    model_used: str | None = Field(default=None, description="Model alias used for runtime call")
+    llm_invoked: bool = Field(default=False, description="Whether an LLM call was attempted")
     timestamp: datetime = Field(default_factory=datetime.now)
 
 
@@ -560,7 +719,9 @@ class InvestmentConclusion(BaseModel):
     position_advice: str = Field(default="", description="仓位建议")
     holding_period: str = Field(default="", description="建议持有周期")
     stop_loss_price: float | None = Field(default=None, description="止损价")
+    consistency_notes: list[str] = Field(default_factory=list, description="流程一致性说明")
     evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="结论证据")
+    execution_trace: list[AgentExecutionRecord] = Field(default_factory=list, description="Agent执行轨迹")
     conclusion_summary: str = Field(description="一段话结论")
 
 
@@ -576,6 +737,9 @@ class ResearchReport(BaseModel):
     conclusion: InvestmentConclusion | None = Field(default=None, description="投资结论")
     chart_pack: list[ChartPackItem] = Field(default_factory=list, description="图表包")
     evidence_pack: list[EvidencePackItem] = Field(default_factory=list, description="证据包")
+    quality_gate: QualityGateDecision | None = Field(default=None, description="质量闸门结果")
+    baseline_snapshot: RegressionBaselineSnapshot | None = Field(default=None, description="结构化回归基线")
+    execution_trace: list[AgentExecutionRecord] = Field(default_factory=list, description="Agent执行轨迹")
     agents_completed: list[str] = Field(default_factory=list, description="已完成的Agent")
     agents_skipped: list[str] = Field(default_factory=list, description="跳过的Agent")
     errors: list[str] = Field(default_factory=list, description="错误列表")
@@ -849,3 +1013,90 @@ class SentimentData(BaseModel):
     neutral_count: int = Field(default=0, description="中性新闻数")
     sentiment_score: float | None = Field(default=None, description="情绪评分(-1到1)")
     hot_topics: list[str] = Field(default_factory=list, description="热门话题关键词")
+
+
+# ============================================================
+# Phase 9: 行业同业批量采集 & 交叉验证
+# ============================================================
+
+
+class PeerCompany(BaseModel):
+    """同业公司"""
+    stock_code: str = Field(description="同业股票代码, 如 002475")
+    stock_name: str = Field(default="", description="同业股票名称")
+    industry_sw: str = Field(default="", description="申万行业分类名称")
+    industry_sw_code: str | None = Field(default=None, description="申万行业代码")
+    industry_level: str = Field(default="二级行业", description="使用的行业级别: 一级行业/二级行业/三级行业")
+    market_cap: float | None = Field(default=None, description="总市值(元)")
+    rank_in_industry: int | None = Field(default=None, description="行业内市值排名")
+
+
+class IndustryDataPoint(BaseModel):
+    """从年报中提取的行业数据点"""
+    metric_name: str = Field(description="指标: market_size/cagr/cr5/market_share")
+    metric_value: float | None = Field(default=None, description="数值")
+    metric_unit: str = Field(default="", description="单位: 亿元/%/家")
+    year: str = Field(default="", description="参考年份, 如 2024")
+    source_company: str = Field(default="", description="来源公司名称")
+    source_company_code: str = Field(default="", description="来源公司代码")
+    source_type: str = Field(default="annual_report", description="来源类型: annual_report/consulting/self_reported")
+    consulting_firm: str = Field(default="", description="引用的咨询机构: IDC/沙利文/...")
+    excerpt: str = Field(default="", description="原文摘录")
+    pdf_url: str = Field(default="", description="来源PDF链接")
+
+
+class CrossVerifiedMetric(BaseModel):
+    """交叉验证后的单个指标"""
+    metric_name: str = Field(description="指标名称")
+    values: list[float] = Field(default_factory=list, description="各来源的值")
+    sources: list[str] = Field(default_factory=list, description="来源公司名称列表")
+    mean_value: float | None = Field(default=None, description="均值")
+    median_value: float | None = Field(default=None, description="中位数")
+    std_dev: float | None = Field(default=None, description="标准差")
+    min_value: float | None = Field(default=None, description="最小值")
+    max_value: float | None = Field(default=None, description="最大值")
+    source_count: int = Field(default=0, description="独立来源数")
+    confidence_score: float = Field(default=0.0, ge=0, le=1, description="置信度评分 0-1")
+    consistency_flag: str = Field(default="insufficient", description="consistent/divergent/insufficient")
+    consulting_sources: list[str] = Field(default_factory=list, description="引用的咨询机构列表")
+    recommended_value: float | None = Field(default=None, description="推荐取值")
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="证据引用")
+
+
+class MetricSourceValue(BaseModel):
+    """Generic numeric observation from one source for cross verification."""
+
+    metric_name: str = Field(description="Metric name")
+    metric_value: float | None = Field(default=None, description="Observed numeric value")
+    metric_unit: str = Field(default="", description="Metric unit")
+    source_name: str = Field(default="", description="Source label")
+    source_type: str = Field(default="unknown", description="Source type")
+    category: str = Field(default="", description="financial/realtime/valuation")
+    reference_date: str = Field(default="", description="Observation date")
+    excerpt: str = Field(default="", description="Short evidence excerpt")
+
+
+class DataCrossVerification(BaseModel):
+    """Cross verification result for company-level financial and market data."""
+
+    stock_code: str = Field(default="", description="Target stock code")
+    latest_report_date: str = Field(default="", description="Latest financial report date used")
+    verified_metrics: list[CrossVerifiedMetric] = Field(default_factory=list, description="Cross-verified metrics")
+    consistent_metrics: list[str] = Field(default_factory=list, description="Metrics with consistent multi-source observations")
+    divergent_metrics: list[str] = Field(default_factory=list, description="Metrics with divergent multi-source observations")
+    insufficient_metrics: list[str] = Field(default_factory=list, description="Metrics without enough cross-source support")
+    overall_confidence: float = Field(default=0.0, ge=0, le=1, description="Overall confidence")
+    summary: str = Field(default="", description="Human-readable summary")
+
+
+class IndustryCrossVerification(BaseModel):
+    """完整行业交叉验证结果"""
+    industry_name: str = Field(default="", description="行业名称")
+    industry_level: str = Field(default="", description="使用的SW行业级别")
+    target_stock_code: str = Field(default="", description="目标股票代码")
+    peer_count: int = Field(default=0, description="同业公司数量")
+    peers: list[PeerCompany] = Field(default_factory=list, description="识别出的同业公司")
+    data_points: list[IndustryDataPoint] = Field(default_factory=list, description="原始提取数据点")
+    verified_metrics: list[CrossVerifiedMetric] = Field(default_factory=list, description="交叉验证指标")
+    overall_confidence: float = Field(default=0.0, ge=0, le=1, description="整体置信度")
+    collection_errors: list[str] = Field(default_factory=list, description="采集错误记录")

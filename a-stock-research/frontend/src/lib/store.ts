@@ -23,12 +23,15 @@ export const useAppStore = create<AppState>((set) => ({
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
 
-  theme: (localStorage.getItem('theme') as 'dark' | 'light') || 'dark',
+  theme: (localStorage.getItem('theme') as 'dark' | 'light') || 'light',
   setTheme: (theme) => {
     localStorage.setItem('theme', theme);
     const root = document.documentElement;
-    root.classList.toggle('dark', theme === 'dark');
-    root.classList.toggle('light', theme === 'light');
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
     set({ theme });
   },
 

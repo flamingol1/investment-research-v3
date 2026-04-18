@@ -281,7 +281,7 @@ function IntelSources() {
             rowKey="id"
             pagination={false}
             size="middle"
-            rowClassName={() => 'hover:bg-white/5'}
+            rowClassName={() => ''}
           />
         )}
       </Card>

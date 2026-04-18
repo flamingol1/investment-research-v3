@@ -62,7 +62,9 @@ def _load_meta(stock_code: str, report_date: str) -> dict[str, Any]:
 
 def _load_conclusion(stock_code: str, report_date: str) -> InvestmentConclusion | None:
     paths = _report_paths(stock_code, report_date)
-    raw = _load_json(paths["conclusion"]) or _load_json(paths["latest_conclusion"])
+    raw = _load_json(paths["conclusion"])
+    if raw is None and not (paths["markdown"].exists() or paths["meta"].exists()):
+        raw = _load_json(paths["latest_conclusion"])
     if not raw:
         return None
     try:
@@ -76,12 +78,20 @@ def _load_conclusion(stock_code: str, report_date: str) -> InvestmentConclusion 
 def _load_pack(stock_code: str, report_date: str, kind: str) -> list[dict[str, Any]]:
     paths = _report_paths(stock_code, report_date)
     latest_key = f"latest_{kind}"
-    raw = _load_json(paths[kind]) or _load_json(paths[latest_key]) or []
+    raw = _load_json(paths[kind])
+    if raw is None and not (paths["markdown"].exists() or paths["meta"].exists()):
+        raw = _load_json(paths[latest_key])
+    raw = raw or []
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
         return list(raw.get(kind, []))
     return []
+
+
+def _unlink_if_exists(path: Path) -> None:
+    if path.exists():
+        path.unlink()
 
 
 def _build_report_summary(
@@ -278,6 +288,7 @@ async def get_report(stock_code: str, date: str) -> ReportDetailResponse:
         evidence_pack=_load_pack(stock_code, date, "evidence_pack"),
         agents_completed=list(meta.get("agents_completed", [])),
         agents_skipped=list(meta.get("agents_skipped", [])),
+        quality_gate=meta.get("quality_gate"),
         errors=list(meta.get("errors", [])),
     )
 
@@ -320,6 +331,8 @@ async def _run_research_background(task_id: str, stock_code: str, depth: str) ->
             )
             paths["conclusion"].write_text(conclusion_payload, encoding="utf-8")
             paths["latest_conclusion"].write_text(conclusion_payload, encoding="utf-8")
+        else:
+            _unlink_if_exists(paths["latest_conclusion"])
 
         if report.chart_pack:
             chart_payload = json.dumps(
@@ -329,6 +342,8 @@ async def _run_research_background(task_id: str, stock_code: str, depth: str) ->
             )
             paths["chart_pack"].write_text(chart_payload, encoding="utf-8")
             paths["latest_chart_pack"].write_text(chart_payload, encoding="utf-8")
+        else:
+            _unlink_if_exists(paths["latest_chart_pack"])
 
         if report.evidence_pack:
             evidence_payload = json.dumps(
@@ -338,6 +353,8 @@ async def _run_research_background(task_id: str, stock_code: str, depth: str) ->
             )
             paths["evidence_pack"].write_text(evidence_payload, encoding="utf-8")
             paths["latest_evidence_pack"].write_text(evidence_payload, encoding="utf-8")
+        else:
+            _unlink_if_exists(paths["latest_evidence_pack"])
 
         meta_payload = json.dumps(
             {
@@ -349,6 +366,8 @@ async def _run_research_background(task_id: str, stock_code: str, depth: str) ->
                 "evidence_pack_count": len(report.evidence_pack),
                 "agents_completed": report.agents_completed,
                 "agents_skipped": report.agents_skipped,
+                "quality_gate": report.quality_gate.model_dump(mode="json") if report.quality_gate else None,
+                "baseline_snapshot": report.baseline_snapshot.model_dump(mode="json") if report.baseline_snapshot else None,
                 "errors": report.errors,
             },
             ensure_ascii=False,

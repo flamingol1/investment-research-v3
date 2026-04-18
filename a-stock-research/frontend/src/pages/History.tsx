@@ -90,7 +90,7 @@ const HistoryPage: React.FC = () => {
           {filtered.map(([code, entries]) => (
             <Card
               key={code}
-              className="hover:border-blue-500/50 transition-colors cursor-pointer"
+              className="transition-all hover:shadow-md cursor-pointer"
               style={{ background: 'var(--color-bg-secondary)' }}
               onClick={() => navigate(`/report/${code}/${entries[0].report_date}`)}
             >

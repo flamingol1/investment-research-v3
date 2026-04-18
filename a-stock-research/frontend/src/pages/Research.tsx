@@ -68,15 +68,15 @@ const formatEventTime = (value?: string) => {
 const toneColor = (tone: TerminalTone) => {
   switch (tone) {
     case 'command':
-      return '#93c5fd';
+      return '#3b82f6';
     case 'running':
-      return '#60a5fa';
+      return '#2563eb';
     case 'success':
-      return '#34d399';
+      return '#059669';
     case 'warning':
-      return '#fbbf24';
+      return '#d97706';
     case 'error':
-      return '#f87171';
+      return '#dc2626';
     default:
       return 'var(--color-text-secondary)';
   }
@@ -442,22 +442,22 @@ const Research: React.FC = () => {
           <Progress
             percent={Math.round(currentProgress * 100)}
             status={taskStatus === 'failed' ? 'exception' : taskStatus === 'completed' ? 'success' : 'active'}
-            strokeColor="#3b82f6"
+            strokeColor={{ from: 'var(--color-brand)', to: '#1d4ed8' }}
           />
 
           <div
             className="mt-5 overflow-hidden rounded-2xl"
             style={{
-              background: '#11161f',
-              border: '1px solid rgba(148, 163, 184, 0.18)',
-              boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
+              background: '#0f172a',
+              border: '1px solid #1e293b',
+              boxShadow: '0 4px 24px rgba(0,0,0,0.15)',
             }}
           >
             <div
               className="flex items-center justify-between gap-3 px-4 py-3"
               style={{
-                background: 'linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01))',
-                borderBottom: '1px solid rgba(148, 163, 184, 0.14)',
+                background: '#1e293b',
+                borderBottom: '1px solid #334155',
               }}
             >
               <div className="flex items-center gap-3">
@@ -468,7 +468,7 @@ const Research: React.FC = () => {
                 </div>
                 <Text
                   style={{
-                    color: 'var(--color-text-primary)',
+                    color: '#e2e8f0',
                     fontFamily: 'Cascadia Code, Consolas, ui-monospace, monospace',
                   }}
                 >
@@ -478,7 +478,7 @@ const Research: React.FC = () => {
 
               <Text
                 style={{
-                  color: 'var(--color-text-muted)',
+                  color: '#64748b',
                   fontSize: 12,
                   fontFamily: 'Cascadia Code, Consolas, ui-monospace, monospace',
                 }}
@@ -492,7 +492,7 @@ const Research: React.FC = () => {
               className="max-h-[560px] min-h-[320px] overflow-auto px-4 py-4"
               style={{
                 fontFamily: 'Cascadia Code, Consolas, ui-monospace, monospace',
-                backgroundImage: 'linear-gradient(rgba(148,163,184,0.035) 1px, transparent 1px)',
+                backgroundImage: 'linear-gradient(rgba(148,163,184,0.04) 1px, transparent 1px)',
                 backgroundSize: '100% 28px',
               }}
             >
@@ -515,14 +515,14 @@ const Research: React.FC = () => {
                     <span
                       style={{
                         color: line.tone === 'command'
-                          ? '#dbeafe'
+                          ? '#93c5fd'
                           : line.tone === 'error'
-                            ? '#fecaca'
+                            ? '#fca5a5'
                             : line.tone === 'warning'
                               ? '#fde68a'
                               : line.tone === 'success'
-                                ? '#bbf7d0'
-                                : 'var(--color-text-secondary)',
+                                ? '#86efac'
+                                : '#94a3b8',
                       }}
                     >
                       {line.text}
@@ -544,7 +544,7 @@ const Research: React.FC = () => {
                   >
                     _
                   </span>
-                  <span style={{ color: 'var(--color-text-muted)' }}>
+                  <span style={{ color: '#64748b' }}>
                     等待下一条进度输出...
                   </span>
                 </div>
@@ -553,14 +553,14 @@ const Research: React.FC = () => {
           </div>
 
           {taskStatus === 'completed' && hasNavigableReport && (
-            <div className="mt-4 flex items-center gap-2 text-green-400">
+            <div className="mt-4 flex items-center gap-2" style={{ color: 'var(--color-success)' }}>
               <CheckCircleOutlined />
               <span>报告已生成，正在跳转...</span>
             </div>
           )}
 
           {taskStatus === 'failed' && (
-            <div className="mt-4 flex items-center gap-2 text-red-400">
+            <div className="mt-4 flex items-center gap-2" style={{ color: 'var(--color-danger)' }}>
               <CloseCircleOutlined />
               <span>任务执行失败，请查看上面的控制台输出。</span>
             </div>

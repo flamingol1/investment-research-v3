@@ -24,7 +24,7 @@ from investresearch.core.models import (
     MonitoringLayer,
     MonitoringPlanItem,
 )
-from investresearch.core.trust import merge_evidence_refs
+from investresearch.core.trust import build_process_consistency_notes, merge_evidence_refs
 
 from .formatting import fmt_cap
 
@@ -83,6 +83,7 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
     """投资结论Agent - 生成标准化投资结论卡片"""
 
     agent_name: str = "conclusion"
+    execution_mode: str = "hybrid"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
         """执行投资结论生成"""
@@ -92,7 +93,30 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
         ).get("stock_info", {}).get("name", "")
         self.logger.info(f"开始生成投资结论 | {stock_code} {stock_name}")
 
-        result = self._build_conclusion(stock_code, stock_name, input_data.context)
+        baseline = self._build_conclusion(stock_code, stock_name, input_data.context)
+        result = dict(baseline)
+        allow_live_llm = bool(input_data.context.get("_allow_live_llm"))
+        llm_invoked = False
+        model_used: str | None = None
+        runtime_mode = "deterministic"
+
+        if allow_live_llm:
+            try:
+                prompt = self._build_prompt(stock_code, stock_name, input_data.context)
+                model = self._get_model()
+                llm_result = await self.llm.call_json(
+                    prompt=prompt,
+                    system_prompt=SYSTEM_PROMPT,
+                    model=model,
+                )
+                llm_invoked = True
+                model_used = model
+                runtime_mode = "llm"
+                result = self._merge_llm_conclusion(baseline, llm_result)
+            except Exception as exc:
+                self.logger.warning(f"结论层LLM不可用，退回规则兜底 | {exc}")
+
+        result = self._apply_guardrails(result, baseline, input_data.context)
         result = self._normalize_conclusion(result)
 
         rec = result.get("recommendation", "未知")
@@ -105,8 +129,11 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
             status=AgentStatus.SUCCESS,
             data={"conclusion": result},
             data_sources=["综合分析结果"],
-            confidence=0.8,
+            confidence=self._confidence_to_score(result.get("confidence_level")),
             summary=summary,
+            execution_mode=runtime_mode,
+            llm_invoked=llm_invoked,
+            model_used=model_used,
         )
 
     def validate_output(self, output: AgentOutput) -> None:
@@ -197,6 +224,10 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
                 "低信心": "低",
             },
         )
+        normalized["consistency_notes"] = ConclusionAgent._unique(
+            ConclusionAgent._as_list(normalized.get("consistency_notes", [])),
+            limit=5,
+        )
         return normalized
 
     @staticmethod
@@ -245,6 +276,29 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
             parts.append(f"- 建议: {screening.get('recommendation', 'N/A')}")
             parts.append("")
 
+        cashflow_caution = self._cashflow_caution_reason(
+            cleaned,
+            context.get("risk_analysis", {}),
+        )
+        if cashflow_caution:
+            parts.append("### 数据质量约束")
+            parts.append(f"- {cashflow_caution}")
+            parts.append(
+                "- 若提及现金流，只能表述为“待验证/缺失/口径异常/需后续财报确认”，不得将现金流改善、现金流与利润匹配良好、净现比改善作为买入理由。"
+            )
+            parts.append("")
+
+        quality_gate = cleaned.get("quality_gate", {})
+        if quality_gate:
+            parts.append("### 证据闸门状态")
+            parts.append(f"- blocked: {quality_gate.get('blocked', False)}")
+            parts.append(f"- 核心证据分: {quality_gate.get('core_evidence_score', 0):.0%}")
+            parts.append(f"- 阻断字段: {self._stringify(quality_gate.get('blocking_fields', []), default='无')}")
+            parts.append(f"- 弱证据字段: {self._stringify(quality_gate.get('weak_fields', []), default='无')}")
+            for note in list(quality_gate.get("consistency_notes", []) or [])[:4]:
+                parts.append(f"- 约束说明: {note}")
+            parts.append("")
+
         # 各分析结论（精炼版）
         analysis_summaries = {
             "financial_analysis": ("财务分析", ["overall_score", "conclusion"]),
@@ -268,6 +322,28 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
                         parts.append(f"- {field}: {val}")
                 parts.append("")
 
+        deep_review = context.get("deep_research_review", {})
+        if deep_review:
+            parts.append("### 深度复核")
+            for field in (
+                "counter_thesis",
+                "review_summary",
+                "confidence_adjustment",
+            ):
+                value = deep_review.get(field)
+                if value:
+                    parts.append(f"- {field}: {value}")
+            for field in (
+                "challenge_points",
+                "key_assumptions",
+                "sensitivity_checks",
+                "what_would_change_my_mind",
+            ):
+                values = deep_review.get(field)
+                if values:
+                    parts.append(f"- {field}: {values}")
+            parts.append("")
+
         parts.append(
             "请综合以上所有分析结论，生成标准化投资结论卡片。"
             "目标价区间需基于估值分析和情景测算综合确定。"
@@ -284,6 +360,9 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
         financial = context.get("financial_analysis", {})
         valuation = context.get("valuation_analysis", {})
         risk = context.get("risk_analysis", {})
+        deep_review = context.get("deep_research_review", {})
+        quality_gate = cleaned.get("quality_gate", {})
+        cashflow_caution = self._cashflow_caution_reason(cleaned, risk)
 
         current_price = self._safe_float(valuation.get("current_price") or realtime.get("close"))
         low = self._safe_float(valuation.get("reasonable_range_low"))
@@ -320,7 +399,10 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
                 valuation.get("conclusion"),
                 business.get("conclusion"),
                 industry.get("conclusion"),
-                financial.get("conclusion"),
+                None
+                if cashflow_caution
+                and self._contains_unsupported_cashflow_claim(financial.get("conclusion"))
+                else financial.get("conclusion"),
             ],
             limit=4,
         ) or ["现阶段仅保留研究跟踪价值，待更多证据支持再强化买入逻辑"]
@@ -338,21 +420,32 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
                 "财务与经营趋势不会出现显著恶化",
                 "行业政策和景气方向不发生突变",
                 "治理信息缺口能够通过后续公告持续补齐",
+                *list(deep_review.get("key_assumptions", []) or []),
             ],
             limit=4,
         )
         monitoring_points = self._unique(
-            list(risk.get("monitoring_points", []) or []) + list((screening.get("key_risks", []) or [])),
+            list(risk.get("monitoring_points", []) or [])
+            + list((screening.get("key_risks", []) or []))
+            + list(deep_review.get("what_would_change_my_mind", []) or []),
             limit=5,
         ) or ["经营兑现", "行业景气", "治理公告"]
         monitoring_plan = self._build_monitoring_plan(monitoring_points)
         failure_conditions = self._unique(
             list(risk.get("fatal_risks", []) or [])
+            + list(deep_review.get("challenge_points", []) or [])
             + ["主营业务兑现低于预期", "治理风险或政策风险显著升级"],
             limit=5,
         )
         catalysts = self._build_catalysts(cleaned)
         conclusion_summary = self._build_summary(stock_code, stock_name, recommendation, confidence_level, valuation, risk_level)
+        consistency_notes = build_process_consistency_notes(
+            screening=screening,
+            valuation=valuation,
+            conclusion={
+                "recommendation": recommendation,
+            },
+        ) + list(quality_gate.get("consistency_notes", []) or [])
 
         return {
             "recommendation": recommendation,
@@ -364,7 +457,17 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
             "risk_level": risk_level,
             "key_reasons_buy": key_reasons_buy,
             "key_reasons_sell": key_reasons_sell,
-            "core_thesis": self._unique([business.get("profit_driver"), industry.get("company_position"), financial.get("trend_summary")], limit=3),
+            "core_thesis": self._unique(
+                [
+                    business.get("profit_driver"),
+                    industry.get("company_position"),
+                    None
+                    if cashflow_caution
+                    and self._contains_unsupported_cashflow_claim(financial.get("trend_summary"))
+                    else financial.get("trend_summary"),
+                ],
+                limit=3,
+            ),
             "expectation_gap": self._build_expectation_gap(valuation, confidence_level),
             "catalysts": catalysts,
             "key_assumptions": key_assumptions,
@@ -377,12 +480,319 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
             "position_advice": self._build_position_advice(recommendation, confidence_level),
             "holding_period": "6-12个月" if recommendation.startswith("买入") else "等待关键信息补齐后再决定",
             "stop_loss_price": round(current_price * 0.88, 2) if current_price and recommendation.startswith("买入") else None,
+            "consistency_notes": consistency_notes[:5],
             "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
+            "execution_trace": list(context.get("execution_trace", []) or []),
             "conclusion_summary": conclusion_summary[:180],
         }
 
+    def _merge_llm_conclusion(
+        self,
+        baseline: dict[str, Any],
+        llm_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(baseline)
+        for key, value in llm_result.items():
+            if value in (None, "", [], {}):
+                continue
+            merged[key] = value
+
+        for key, limit in (
+            ("key_reasons_buy", 4),
+            ("key_reasons_sell", 4),
+            ("key_assumptions", 4),
+            ("monitoring_points", 5),
+            ("core_thesis", 4),
+            ("major_risks", 5),
+            ("failure_conditions", 5),
+            ("catalysts", 4),
+            ("return_breakdown", 4),
+        ):
+            merged[key] = self._unique(
+                self._as_list(llm_result.get(key, [])) + self._as_list(baseline.get(key, [])),
+                limit=limit,
+            )
+        return merged
+
+    def _apply_guardrails(
+        self,
+        conclusion: dict[str, Any],
+        baseline: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        guarded = self._merge_llm_conclusion(baseline, conclusion)
+        cleaned = context.get("cleaned_data", {})
+        valuation = context.get("valuation_analysis", {})
+        governance = context.get("governance_analysis", {})
+        industry = context.get("industry_analysis", {})
+        risk = context.get("risk_analysis", {})
+        deep_review = context.get("deep_research_review", {})
+        quality_gate = cleaned.get("quality_gate", {}) if isinstance(cleaned, dict) else {}
+        cashflow_caution = self._cashflow_caution_reason(cleaned, risk)
+
+        coverage = float(cleaned.get("coverage_ratio", 0.0) or 0.0)
+        valuation_ok = valuation.get("evidence_status") == "ok"
+        critical_ok = sum(
+            1
+            for item in (valuation, governance, industry)
+            if item.get("evidence_status") == "ok"
+        )
+        blocked = bool(quality_gate.get("blocked"))
+        core_evidence = float(quality_gate.get("core_evidence_score", 0.0) or 0.0)
+        blocking_fields = [str(item) for item in list(quality_gate.get("blocking_fields", []) or []) if str(item).strip()]
+        weak_fields = [str(item) for item in list(quality_gate.get("weak_fields", []) or []) if str(item).strip()]
+
+        if blocked or blocking_fields or core_evidence < 0.7:
+            guarded["recommendation"] = "观望"
+            guarded["target_price_low"] = None
+            guarded["target_price_high"] = None
+            guarded["upside_pct"] = None
+            guarded["valuation_range"] = "核心证据不足，暂不输出估值区间"
+
+        if not valuation_ok:
+            guarded["target_price_low"] = baseline.get("target_price_low")
+            guarded["target_price_high"] = baseline.get("target_price_high")
+            guarded["upside_pct"] = baseline.get("upside_pct")
+            if str(guarded.get("recommendation", "")).startswith("买入"):
+                guarded["recommendation"] = "观望"
+
+        risk_level = guarded.get("risk_level") or baseline.get("risk_level") or "中"
+        if not (blocked or blocking_fields):
+            if risk_level == "极高":
+                guarded["recommendation"] = "卖出"
+            elif risk_level == "高" and guarded.get("recommendation") == "买入(强烈)":
+                guarded["recommendation"] = "买入(谨慎)"
+
+        confidence_level = guarded.get("confidence_level") or baseline.get("confidence_level") or "中"
+        if blocked or blocking_fields or core_evidence < 0.7:
+            confidence_level = "低"
+        elif coverage < 0.45 or critical_ok == 0:
+            confidence_level = "低"
+        elif coverage < 0.7 and confidence_level == "高":
+            confidence_level = "中"
+        if cashflow_caution and confidence_level == "高":
+            confidence_level = "中"
+
+        adjustment = str(deep_review.get("confidence_adjustment") or "").lower()
+        if adjustment in {"lower", "decrease"}:
+            confidence_level = self._lower_confidence_label(confidence_level)
+        elif adjustment in {"raise", "increase"} and coverage >= 0.75 and critical_ok >= 2:
+            confidence_level = self._raise_confidence_label(confidence_level)
+        guarded["confidence_level"] = confidence_level
+
+        if cashflow_caution:
+            cashflow_risk = "关键现金流字段缺失或口径待验证，暂不能用利润含金量支撑买入逻辑"
+            guarded["key_reasons_buy"] = self._filter_unsupported_cashflow_claims(
+                guarded.get("key_reasons_buy", []),
+                fallback=self._as_list(baseline.get("key_reasons_buy", [])),
+                minimum=1,
+                limit=4,
+            )
+            guarded["core_thesis"] = self._filter_unsupported_cashflow_claims(
+                guarded.get("core_thesis", []),
+                fallback=self._as_list(baseline.get("core_thesis", [])),
+                minimum=2,
+                limit=4,
+            )
+            guarded["key_reasons_sell"] = self._unique(
+                [cashflow_risk] + self._as_list(guarded.get("key_reasons_sell", [])),
+                limit=4,
+            )
+            guarded["major_risks"] = self._unique(
+                [cashflow_risk] + self._as_list(guarded.get("major_risks", [])),
+                limit=5,
+            )
+            guarded["failure_conditions"] = self._unique(
+                [cashflow_risk] + self._as_list(guarded.get("failure_conditions", [])),
+                limit=5,
+            )
+
+        guarded["key_reasons_buy"] = self._ensure_minimum_list(
+            self._as_list(guarded.get("key_reasons_buy", [])),
+            ["当前仅保留跟踪价值，买入逻辑仍需更多证据支持"],
+            minimum=1,
+            limit=4,
+        )
+        guarded["key_reasons_sell"] = self._ensure_minimum_list(
+            self._as_list(guarded.get("key_reasons_sell", [])),
+            ["关键数据与验证条件尚未齐备"],
+            minimum=1,
+            limit=4,
+        )
+        guarded["key_assumptions"] = self._ensure_minimum_list(
+            self._as_list(guarded.get("key_assumptions", [])),
+            self._as_list(baseline.get("key_assumptions", [])),
+            minimum=2,
+            limit=4,
+        )
+        guarded["monitoring_points"] = self._ensure_minimum_list(
+            self._as_list(guarded.get("monitoring_points", [])),
+            self._as_list(baseline.get("monitoring_points", [])) or ["经营兑现", "行业景气", "治理公告"],
+            minimum=3,
+            limit=5,
+        )
+        guarded["monitoring_plan"] = [
+            item.model_dump(mode="json")
+            for item in self._build_monitoring_plan(self._as_list(guarded.get("monitoring_points", [])))
+        ]
+        guarded["failure_conditions"] = self._ensure_minimum_list(
+            self._as_list(guarded.get("failure_conditions", [])),
+            self._as_list(baseline.get("failure_conditions", [])),
+            minimum=2,
+            limit=5,
+        )
+        guarded["major_risks"] = self._unique(
+            self._as_list(guarded.get("major_risks", []))
+            + self._as_list(guarded.get("key_reasons_sell", [])),
+            limit=5,
+        )
+        if blocked or blocking_fields:
+            gate_reason = (
+                f"核心证据闸门未满足，阻断字段包括: {', '.join(blocking_fields[:5])}"
+                if blocking_fields
+                else "核心证据闸门未满足，当前结论仅允许保守输出"
+            )
+            guarded["key_reasons_sell"] = self._unique(
+                [gate_reason] + self._as_list(guarded.get("key_reasons_sell", [])),
+                limit=4,
+            )
+            guarded["major_risks"] = self._unique(
+                [gate_reason] + self._as_list(guarded.get("major_risks", [])),
+                limit=5,
+            )
+        elif weak_fields:
+            weak_reason = f"部分核心字段仍为弱证据: {', '.join(weak_fields[:5])}"
+            guarded["key_reasons_sell"] = self._unique(
+                [weak_reason] + self._as_list(guarded.get("key_reasons_sell", [])),
+                limit=4,
+            )
+        guarded["position_advice"] = self._build_position_advice(
+            guarded["recommendation"],
+            guarded["confidence_level"],
+        )
+        guarded["holding_period"] = (
+            "6-12个月" if str(guarded.get("recommendation", "")).startswith("买入") else "等待关键信息补齐后再决定"
+        )
+
+        current_price = self._safe_float(guarded.get("current_price"))
+        if str(guarded.get("recommendation", "")).startswith("买入") and current_price:
+            guarded["stop_loss_price"] = round(current_price * 0.88, 2)
+        else:
+            guarded["stop_loss_price"] = None
+
+        low = self._safe_float(guarded.get("target_price_low"))
+        high = self._safe_float(guarded.get("target_price_high"))
+        if low is not None and high is not None:
+            guarded["valuation_range"] = f"{low}-{high}"
+        else:
+            guarded["valuation_range"] = baseline.get("valuation_range", "估值区间待验证")
+
+        guarded["expectation_gap"] = guarded.get("expectation_gap") or baseline.get("expectation_gap", "")
+        guarded["execution_trace"] = list(context.get("execution_trace", []) or [])
+        guarded["consistency_notes"] = self._unique(
+            self._as_list(guarded.get("consistency_notes", []))
+            + build_process_consistency_notes(
+                screening=context.get("screening", {}),
+                valuation=valuation,
+                conclusion=guarded,
+            )
+            + self._as_list(quality_gate.get("consistency_notes", [])),
+            limit=5,
+        )
+
+        summary = str(guarded.get("conclusion_summary") or baseline.get("conclusion_summary") or "").strip()
+        if cashflow_caution and self._contains_unsupported_cashflow_claim(summary):
+            summary = str(baseline.get("conclusion_summary") or "").strip()
+        if blocked or blocking_fields:
+            summary = (
+                f"{context.get('stock_code', '')} {context.get('stock_name', '')} 当前核心证据不足，"
+                f"结论已降级为观望，需先补齐 {', '.join(blocking_fields[:3]) or '关键阻断字段'}。"
+            ).strip()
+        if not summary:
+            summary = self._build_summary(
+                context.get("stock_code", ""),
+                context.get("stock_name", ""),
+                guarded["recommendation"],
+                guarded["confidence_level"],
+                valuation,
+                risk_level,
+        )
+        guarded["conclusion_summary"] = summary[:180]
+        return guarded
+
+    @staticmethod
+    def _cashflow_caution_reason(cleaned: dict[str, Any], risk: dict[str, Any]) -> str:
+        financials = cleaned.get("financials", []) or []
+        suspect = any(
+            isinstance(item, dict) and item.get("_cashflow_suspect_fields")
+            for item in financials[:4]
+        )
+        missing_fields = set(cleaned.get("missing_fields", []) or [])
+        missing_cashflow = any(
+            field in missing_fields
+            for field in (
+                "financials.operating_cashflow",
+                "financials.free_cashflow",
+                "financials.cash_to_profit",
+            )
+        )
+        risk_texts = " ".join(
+            str(item)
+            for item in (
+                *(risk.get("fatal_risks", []) or []),
+                risk.get("conclusion", ""),
+            )
+        )
+        risk_flag = any(
+            token in risk_texts for token in ("现金流", "真实性存疑", "口径", "量纲")
+        )
+        if suspect or missing_cashflow or risk_flag:
+            return "现金流相关指标存在缺失或口径待验证情况，不能将其作为买入论据"
+        return ""
+
+    @staticmethod
+    def _contains_unsupported_cashflow_claim(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        cashflow_terms = ("现金流", "净现比", "经营活动产生的现金流量净额")
+        positive_terms = ("良好", "匹配", "较好", "改善", "稳健", "充沛", "健康", "优异", "转好", "转正")
+        caution_terms = ("待验证", "缺失", "异常", "存疑", "不匹配", "矛盾", "不一致", "风险")
+        has_cashflow = any(term in text for term in cashflow_terms)
+        has_positive = any(term in text for term in positive_terms)
+        has_caution = any(term in text for term in caution_terms)
+        return has_cashflow and has_positive and not has_caution
+
+    def _filter_unsupported_cashflow_claims(
+        self,
+        items: Any,
+        *,
+        fallback: list[str] | None = None,
+        minimum: int = 0,
+        limit: int = 4,
+    ) -> list[str]:
+        filtered = [
+            item
+            for item in self._as_list(items)
+            if not self._contains_unsupported_cashflow_claim(item)
+        ]
+        fallback_items = [
+            item
+            for item in self._as_list(fallback or [])
+            if not self._contains_unsupported_cashflow_claim(item)
+        ]
+        return self._ensure_minimum_list(
+            filtered,
+            fallback_items,
+            minimum=minimum,
+            limit=limit,
+        )
+
     @staticmethod
     def _infer_confidence(cleaned: dict[str, Any], valuation: dict[str, Any], governance: dict[str, Any], industry: dict[str, Any]) -> str:
+        quality_gate = cleaned.get("quality_gate", {}) if isinstance(cleaned, dict) else {}
+        if quality_gate.get("blocked") or float(quality_gate.get("core_evidence_score", 0.0) or 0.0) < 0.7:
+            return "低"
         coverage = float(cleaned.get("coverage_ratio", 0.0) or 0.0)
         critical_ok = sum(
             1
@@ -502,6 +912,54 @@ class ConclusionAgent(AgentBase[AgentInput, AgentOutput]):
             f"{stock_code} {stock_name} 当前建议为{recommendation}，置信度{confidence_level}，"
             f"风险等级{risk_level}，估值判断{valuation_level}。"
         )
+
+    @staticmethod
+    def _confidence_to_score(label: Any) -> float:
+        mapping = {"高": 0.85, "中": 0.68, "低": 0.45}
+        return mapping.get(str(label), 0.5)
+
+    @staticmethod
+    def _lower_confidence_label(label: str) -> str:
+        if label == "高":
+            return "中"
+        if label == "中":
+            return "低"
+        return "低"
+
+    @staticmethod
+    def _raise_confidence_label(label: str) -> str:
+        if label == "低":
+            return "中"
+        if label == "中":
+            return "高"
+        return "高"
+
+    @staticmethod
+    def _ensure_minimum_list(
+        items: list[Any],
+        fallbacks: list[Any],
+        *,
+        minimum: int,
+        limit: int,
+    ) -> list[str]:
+        values = ConclusionAgent._unique(items, limit=limit)
+        if len(values) >= minimum:
+            return values
+        fallback_values = ConclusionAgent._unique(fallbacks, limit=limit)
+        for item in fallback_values:
+            if item not in values:
+                values.append(item)
+            if len(values) >= minimum or len(values) >= limit:
+                break
+        return values[:limit]
+
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if value in (None, "", {}):
+            return []
+        return [value]
 
     @staticmethod
     def _unique(items: list[Any], limit: int = 5) -> list[str]:

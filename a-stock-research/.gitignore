@@ -31,3 +31,10 @@ htmlcov/
 
 # MyPy
 .mypy_cache/
+
+# Local temporary logs
+tmp_logs/
+tmp_logs_frontend/
+
+# Frontend build cache
+*.tsbuildinfo

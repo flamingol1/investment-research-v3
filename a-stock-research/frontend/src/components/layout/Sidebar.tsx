@@ -57,8 +57,12 @@ const Sidebar: React.FC = () => {
         </div>
         {!collapsed && (
           <div className="flex flex-col">
-            <span className="text-sm font-semibold text-gray-100">A股投研系统</span>
-            <span className="text-xs text-gray-500">Multi-Agent Research</span>
+            <span className="text-sm font-semibold" style={{ color: 'var(--color-text-primary)' }}>
+              A股投研系统
+            </span>
+            <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              Multi-Agent Research
+            </span>
           </div>
         )}
       </div>
@@ -74,10 +78,25 @@ const Sidebar: React.FC = () => {
               onClick={() => navigate(item.key)}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors ${
                 isActive
-                  ? 'text-white'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
+                  ? 'font-medium'
+                  : ''
               }`}
-              style={isActive ? { background: 'var(--color-brand)' } : undefined}
+              style={isActive
+                ? { background: 'var(--color-brand)', color: 'var(--color-nav-active-text)' }
+                : { color: 'var(--color-nav-inactive-text)' }
+              }
+              onMouseEnter={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.background = 'var(--color-nav-hover-bg)';
+                  e.currentTarget.style.color = 'var(--color-text-primary)';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'var(--color-nav-inactive-text)';
+                }
+              }}
               title={collapsed ? item.label : undefined}
             >
               <span className="text-lg">{item.icon}</span>
@@ -89,7 +108,10 @@ const Sidebar: React.FC = () => {
         {/* Intelligence Hub Section */}
         {!collapsed && (
           <div className="pt-4 pb-1 px-3">
-            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+            <span
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--color-section-label)' }}
+            >
               情报中心
             </span>
           </div>
@@ -102,11 +124,24 @@ const Sidebar: React.FC = () => {
               key={item.key}
               onClick={() => navigate(item.key)}
               className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-                isActive
-                  ? 'text-white'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
+                isActive ? 'font-medium' : ''
               }`}
-              style={isActive ? { background: 'var(--color-brand)' } : undefined}
+              style={isActive
+                ? { background: 'var(--color-brand)', color: 'var(--color-nav-active-text)' }
+                : { color: 'var(--color-nav-inactive-text)' }
+              }
+              onMouseEnter={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.background = 'var(--color-nav-hover-bg)';
+                  e.currentTarget.style.color = 'var(--color-text-primary)';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.background = 'transparent';
+                  e.currentTarget.style.color = 'var(--color-nav-inactive-text)';
+                }
+              }}
               title={collapsed ? item.label : undefined}
             >
               <span className="text-lg"><DatabaseOutlined /></span>
@@ -119,8 +154,8 @@ const Sidebar: React.FC = () => {
       {/* Footer */}
       {!collapsed && (
         <div
-          className="px-4 py-3 border-t text-xs text-gray-500"
-          style={{ borderColor: 'var(--color-border)' }}
+          className="px-4 py-3 border-t text-xs"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-footer-text)' }}
         >
           <div className="flex items-center gap-1">
             <BulbOutlined />

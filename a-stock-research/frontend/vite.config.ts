@@ -6,31 +6,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api/ws': {
-        target: 'ws://127.0.0.1:8000',
-        ws: true,
-      },
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8001',
         changeOrigin: true,
-      },
-      '/ws': {
-        target: 'ws://127.0.0.1:8000',
-        ws: true,
-      },
-    },
-  },
-  build: {
-    outDir: 'dist',
-    sourcemap: false,
-    chunkSizeWarningLimit: 1000,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          antd: ['antd', '@ant-design/icons'],
-          echarts: ['echarts', 'echarts-for-react'],
-        },
       },
     },
   },

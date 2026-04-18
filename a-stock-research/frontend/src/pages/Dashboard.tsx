@@ -44,13 +44,13 @@ const Dashboard: React.FC = () => {
       {/* 统计卡片 */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card
-          className="cursor-pointer hover:border-blue-500/50 transition-colors"
+          className="cursor-pointer transition-all hover:shadow-md"
           onClick={() => navigate('/watch')}
         >
           <Statistic
             title={<Text style={{ color: 'var(--color-text-secondary)' }}>监控标的</Text>}
             value={watchItems.length}
-            prefix={<EyeOutlined style={{ color: '#3b82f6' }} />}
+            prefix={<EyeOutlined style={{ color: 'var(--color-brand)' }} />}
             suffix={
               alertCount > 0 && (
                 <Tag color="red" className="ml-2">
@@ -63,13 +63,13 @@ const Dashboard: React.FC = () => {
         </Card>
 
         <Card
-          className="cursor-pointer hover:border-blue-500/50 transition-colors"
+          className="cursor-pointer transition-all hover:shadow-md"
           onClick={() => navigate('/history')}
         >
           <Statistic
             title={<Text style={{ color: 'var(--color-text-secondary)' }}>研究报告</Text>}
             value={reports.length}
-            prefix={<FileSearchOutlined style={{ color: '#10b981' }} />}
+            prefix={<FileSearchOutlined style={{ color: 'var(--color-success)' }} />}
             valueStyle={{ color: 'var(--color-text-primary)' }}
           />
         </Card>
@@ -78,31 +78,31 @@ const Dashboard: React.FC = () => {
           <Statistic
             title={<Text style={{ color: 'var(--color-text-secondary)' }}>系统状态</Text>}
             value="运行中"
-            prefix={<AlertOutlined style={{ color: '#22c55e' }} />}
-            valueStyle={{ color: '#22c55e', fontSize: 20 }}
+            prefix={<AlertOutlined style={{ color: 'var(--color-success)' }} />}
+            valueStyle={{ color: 'var(--color-success)', fontSize: 20 }}
           />
         </Card>
       </div>
 
       {/* 快速研究入口 */}
       <Card
-        className="cursor-pointer hover:border-blue-500/50 transition-colors"
+        className="cursor-pointer transition-all hover:shadow-lg"
         style={{
-          background: 'linear-gradient(135deg, var(--color-bg-secondary), var(--color-bg-elevated))',
-          border: '1px solid var(--color-border)',
+          background: 'linear-gradient(135deg, var(--color-brand), #1d4ed8)',
+          border: 'none',
         }}
         onClick={() => navigate('/research')}
       >
         <div className="flex items-center justify-between py-4">
           <div>
-            <Title level={4} style={{ color: 'var(--color-text-primary)', margin: 0 }}>
+            <Title level={4} style={{ color: '#ffffff', margin: 0 }}>
               开始新的股票研究
             </Title>
-            <Text style={{ color: 'var(--color-text-secondary)' }}>
+            <Text style={{ color: 'rgba(255,255,255,0.85)' }}>
               输入股票代码，AI自动完成7阶段深度研究分析
             </Text>
           </div>
-          <div className="flex items-center gap-2 text-blue-400">
+          <div className="flex items-center gap-2" style={{ color: '#ffffff' }}>
             <span>开始研究</span>
             <RightOutlined />
           </div>
@@ -116,7 +116,8 @@ const Dashboard: React.FC = () => {
             最近研究报告
           </Title>
           <button
-            className="text-sm text-blue-400 hover:text-blue-300"
+            className="text-sm"
+            style={{ color: 'var(--color-brand)' }}
             onClick={() => navigate('/history')}
           >
             查看全部 <RightOutlined />
@@ -136,7 +137,7 @@ const Dashboard: React.FC = () => {
             {reports.slice(0, 6).map((r) => (
               <Card
                 key={`${r.stock_code}-${r.report_date}`}
-                className="cursor-pointer hover:border-blue-500/50 transition-colors"
+                className="cursor-pointer transition-all hover:shadow-md"
                 onClick={() => navigate(`/report/${r.stock_code}/${r.report_date}`)}
                 size="small"
               >

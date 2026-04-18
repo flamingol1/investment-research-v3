@@ -1,4 +1,4 @@
-"""风险分析Agent - 全维度风险清单、三情景测算
+﻿"""风险分析Agent - 全维度风险清单、三情景测算
 
 分析维度:
 1. 行业风险: 技术变革、政策变化、周期波动
@@ -143,6 +143,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
     """风险分析Agent - 全维度风险清单、三情景测算"""
 
     agent_name: str = "risk"
+    execution_mode: str = "hybrid"
 
     async def run(self, input_data: AgentInput) -> AgentOutput:
         """执行风险分析"""
@@ -159,7 +160,30 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         stock_name = input_data.stock_name or cleaned.get("stock_info", {}).get("name", "")
         self.logger.info(f"开始风险分析 | {stock_code} {stock_name}")
 
-        result = self._build_result(context)
+        baseline = self._build_result(context)
+        result = dict(baseline)
+        allow_live_llm = bool(context.get("_allow_live_llm"))
+        llm_invoked = False
+        model_used: str | None = None
+        runtime_mode = "deterministic"
+
+        if allow_live_llm:
+            model = self._get_model()
+            model_used = model
+            llm_invoked = True
+            try:
+                llm_result = await self.llm.call_json(
+                    prompt=self._build_prompt(stock_code, stock_name, context),
+                    system_prompt=SYSTEM_PROMPT,
+                    model=model,
+                )
+                result = self._merge_llm_result(baseline, llm_result)
+                runtime_mode = "llm"
+            except Exception as exc:
+                self.logger.warning(f"风险分析 LLM 不可用，回退规则结果 | {exc}")
+                runtime_mode = "hybrid"
+
+        result = self._normalize_result(result, baseline)
 
         level = result.get("overall_risk_level", "未知")
         score = result.get("risk_score", 0)
@@ -174,6 +198,9 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
             data_sources=["financials", "governance", "announcements", "policy_documents", "realtime"],
             confidence=0.75 if result.get("evidence_status") == "ok" else 0.45,
             summary=summary,
+            execution_mode=runtime_mode,
+            llm_invoked=llm_invoked,
+            model_used=model_used if runtime_mode != "deterministic" else None,
         )
 
     def validate_output(self, output: AgentOutput) -> None:
@@ -237,6 +264,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         stock_info = cleaned.get("stock_info", {})
         announcements = cleaned.get("announcements", [])
         policy_documents = cleaned.get("policy_documents", [])
+        cross_verification = cleaned.get("cross_verification", {})
 
         latest_financial = financials[0] if financials and isinstance(financials[0], dict) else {}
         governance_profile = get_module_profile(cleaned, "governance")
@@ -244,23 +272,24 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         financial_profile = get_module_profile(cleaned, "financials")
         industry_profile = get_module_profile(cleaned, "industry_enhanced")
         valuation_profile = get_module_profile(cleaned, "valuation_percentile")
+        cross_profile = get_module_profile(cleaned, "cross_verification")
 
         risks = [
             self._industry_risk(industry_profile, cleaned.get("industry_enhanced", {})),
             self._operating_risk(stock_info, latest_financial, announcements),
-            self._financial_risk(latest_financial, financial_profile.completeness),
+            self._financial_risk(latest_financial, financial_profile.completeness, cross_verification),
             self._governance_risk(governance_profile, cleaned.get("governance", {})),
             self._market_risk(realtime, cleaned.get("valuation_percentile", {}), valuation_profile.completeness),
             self._policy_risk(policy_documents, policy_profile.completeness),
         ]
         risks = [risk for risk in risks if risk]
 
-        risk_score = self._calculate_risk_score(risks, screening)
+        risk_score = self._calculate_risk_score(risks, screening, cross_verification)
         overall_risk_level = self._risk_level_from_score(risk_score)
         current_price = self._safe_float(realtime.get("close"))
         scenarios = self._build_scenarios(current_price, overall_risk_level)
 
-        monitoring_points = self._build_monitoring_points(risks, stock_info, latest_financial)
+        monitoring_points = self._build_monitoring_points(risks, stock_info, latest_financial, cross_verification)
         fatal_risks = [
             risk["risk_name"]
             for risk in risks
@@ -270,22 +299,28 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
             financial_profile.evidence_refs,
             governance_profile.evidence_refs,
             policy_profile.evidence_refs,
+            cross_profile.evidence_refs,
             get_module_profile(cleaned, "announcements").evidence_refs,
         )
-        evidence_status = "ok" if financial_profile.completeness >= 0.4 else "partial"
+        divergent_metrics = list(cross_verification.get("divergent_metrics", []) or [])
+        evidence_status = "ok" if financial_profile.completeness >= 0.4 and not divergent_metrics else "partial"
+
+        conclusion = (
+            f"当前风险等级为{overall_risk_level}，需重点跟踪 {monitoring_points[0]}。"
+            if monitoring_points
+            else f"当前风险等级为{overall_risk_level}。"
+        )
+        if divergent_metrics:
+            conclusion += f" 另需优先复核多源分歧指标: {', '.join(divergent_metrics[:4])}。"
 
         return {
             "overall_risk_level": overall_risk_level,
             "risk_score": risk_score,
             "risks": risks,
             "scenarios": scenarios,
-            "fatal_risks": fatal_risks or ["关键资料缺失导致投资逻辑暂无法充分验证"],
+            "fatal_risks": fatal_risks or ["关键资料缺失导致投资逻辑暂无充分验证"],
             "monitoring_points": monitoring_points,
-            "conclusion": (
-                f"当前风险等级为{overall_risk_level}，需重点跟踪 {monitoring_points[0]}。"
-                if monitoring_points
-                else f"当前风险等级为{overall_risk_level}。"
-            ),
+            "conclusion": conclusion,
             "evidence_status": evidence_status,
             "missing_fields": sorted(
                 set(
@@ -293,6 +328,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
                     + financial_profile.missing_fields
                     + industry_profile.missing_fields
                     + valuation_profile.missing_fields
+                    + cross_profile.missing_fields
                 )
             ),
             "evidence_refs": [item.model_dump(mode="json") for item in evidence_refs],
@@ -350,9 +386,20 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         }
 
     @staticmethod
-    def _financial_risk(latest_financial: dict[str, Any], completeness: float) -> dict[str, Any]:
-        debt_ratio = latest_financial.get("debt_ratio")
-        operating_cashflow = latest_financial.get("operating_cashflow")
+    def _financial_risk(
+        latest_financial: dict[str, Any],
+        completeness: float,
+        cross_verification: dict[str, Any],
+    ) -> dict[str, Any]:
+        debt_ratio = RiskAgent._safe_float(latest_financial.get("debt_ratio"))
+        operating_cashflow = RiskAgent._safe_float(latest_financial.get("operating_cashflow"))
+        suspect_fields = list(latest_financial.get("_cashflow_suspect_fields", []) or [])
+        divergent_metrics = set(cross_verification.get("divergent_metrics", []) or [])
+        key_divergent_metrics = [
+            metric
+            for metric in ("revenue", "net_profit", "operating_cashflow", "market_cap", "pe_ttm", "pb_mrq")
+            if metric in divergent_metrics
+        ]
         if completeness < 0.4:
             return {
                 "category": "财务",
@@ -362,10 +409,28 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
                 "impact": "现金流、商誉、负债等关键字段未充分覆盖。",
                 "mitigation": "补齐财务深水区字段并重新评估。",
             }
-        if debt_ratio is not None and float(debt_ratio) >= 65:
+        if suspect_fields:
+            return {
+                "category": "财务",
+                "risk_name": "现金流口径待验证",
+                "severity": "中",
+                "probability": "高",
+                "impact": f"字段 {', '.join(suspect_fields)} 疑似存在量纲异常，当前现金流质量判断不可靠。",
+                "mitigation": "优先以审计口径或原始财报附注复核现金流单位与净现比。",
+            }
+        if key_divergent_metrics:
+            return {
+                "category": "财务",
+                "risk_name": "关键指标多源分歧",
+                "severity": "高",
+                "probability": "高",
+                "impact": f"多源交叉验证发现 {', '.join(key_divergent_metrics)} 存在分歧，当前财务与估值判断可信度明显下降。",
+                "mitigation": "回溯官方财报、行情源和衍生计算口径，确认最新可用的一致值后再给出判断。",
+            }
+        if debt_ratio is not None and debt_ratio >= 65:
             severity = "高"
         else:
-            severity = "中" if operating_cashflow is not None and float(operating_cashflow) < 0 else "低"
+            severity = "中" if operating_cashflow is not None and operating_cashflow < 0 else "低"
         return {
             "category": "财务",
             "risk_name": "杠杆与现金流风险",
@@ -448,7 +513,11 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         }
 
     @staticmethod
-    def _calculate_risk_score(risks: list[dict[str, Any]], screening: dict[str, Any]) -> float:
+    def _calculate_risk_score(
+        risks: list[dict[str, Any]],
+        screening: dict[str, Any],
+        cross_verification: dict[str, Any],
+    ) -> float:
         severity_map = {"低": 1.0, "中": 1.8, "高": 2.7}
         probability_map = {"低": 0.7, "中": 1.0, "高": 1.3}
         score = 0.0
@@ -456,6 +525,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
             score += severity_map.get(risk.get("severity", "中"), 1.8) * probability_map.get(risk.get("probability", "中"), 1.0)
         if screening.get("key_risks"):
             score += 0.8
+        score += min(1.5, len(list(cross_verification.get("divergent_metrics", []) or [])) * 0.35)
         return round(min(score, 10.0), 2)
 
     @staticmethod
@@ -489,12 +559,20 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         ]
 
     @staticmethod
-    def _build_monitoring_points(risks: list[dict[str, Any]], stock_info: dict[str, Any], latest_financial: dict[str, Any]) -> list[str]:
+    def _build_monitoring_points(
+        risks: list[dict[str, Any]],
+        stock_info: dict[str, Any],
+        latest_financial: dict[str, Any],
+        cross_verification: dict[str, Any],
+    ) -> list[str]:
         points = [
             "行业景气度与政策关键词变化",
             "季度营收/净利润/经营现金流是否兑现",
             "治理事件、质押、担保、诉讼公告",
         ]
+        divergent_metrics = list(cross_verification.get("divergent_metrics", []) or [])
+        if divergent_metrics:
+            points.insert(0, f"多源分歧指标复核: {', '.join(divergent_metrics[:4])}")
         if stock_info.get("main_business"):
             points.append(f"主营业务[{stock_info.get('main_business')[:18]}]的经营兑现")
         if latest_financial.get("debt_ratio") is not None:
@@ -505,8 +583,9 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
                 deduped.append(item)
         return deduped[:5]
 
-    def _build_prompt(self, stock_code: str, stock_name: str, cleaned: dict) -> str:
+    def _build_prompt(self, stock_code: str, stock_name: str, context: dict[str, Any]) -> str:
         """构建风险分析提示词"""
+        cleaned = context.get("cleaned_data", {})
         parts = [f"## 标的: {stock_code} {stock_name}\n"]
 
         # 公司基本信息
@@ -557,6 +636,25 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
                 )
             parts.append("")
 
+        cross_verification = cleaned.get("cross_verification", {})
+        if cross_verification and cross_verification.get("verified_metrics"):
+            parts.append("### 多来源交叉验证")
+            parts.append(f"- 整体置信度: {cross_verification.get('overall_confidence', 0):.0%}")
+            if cross_verification.get("summary"):
+                parts.append(f"- 总结: {cross_verification.get('summary')}")
+            for metric in cross_verification.get("verified_metrics", [])[:5]:
+                if not isinstance(metric, dict):
+                    continue
+                parts.append(
+                    f"- {metric.get('metric_name', 'N/A')}: "
+                    f"consistency={metric.get('consistency_flag', 'N/A')} | "
+                    f"recommended={metric.get('recommended_value', 'N/A')} | "
+                    f"sources={', '.join(metric.get('sources', [])[:4]) or 'N/A'}"
+                )
+            if cross_verification.get("divergent_metrics"):
+                parts.append(f"- 需重点复核: {', '.join(cross_verification.get('divergent_metrics', [])[:5])}")
+            parts.append("")
+
         # 当前估值（市场风险评估用）
         realtime = cleaned.get("realtime", {})
         if realtime:
@@ -568,7 +666,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
             parts.append("")
 
         # 上游分析结论
-        screening = cleaned.get("screening", {})
+        screening = context.get("screening", {})
         if screening:
             parts.append(f"### 初筛结论: {screening.get('verdict', 'N/A')}")
             key_risks = screening.get("key_risks", [])
@@ -576,14 +674,14 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
                 parts.append(f"- 初筛风险: {', '.join(key_risks[:5])}")
             parts.append("")
 
-        financial_analysis = cleaned.get("financial_analysis", {})
+        financial_analysis = context.get("financial_analysis", {})
         if financial_analysis:
             anomaly_flags = financial_analysis.get("anomaly_flags", [])
             if anomaly_flags:
                 parts.append(f"### 财务异常标记: {', '.join(anomaly_flags[:5])}")
             parts.append("")
 
-        valuation_analysis = cleaned.get("valuation_analysis", {})
+        valuation_analysis = context.get("valuation_analysis", {})
         if valuation_analysis:
             parts.append(f"### 估值结论: {valuation_analysis.get('valuation_level', 'N/A')}")
             parts.append(f"- 合理区间: {valuation_analysis.get('reasonable_range_low', 'N/A')}-{valuation_analysis.get('reasonable_range_high', 'N/A')}")
@@ -612,6 +710,167 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         parts.append("请根据以上数据对该标的进行全维度风险分析和三情景测算，按指定JSON格式输出。必须覆盖行业/经营/财务/治理/市场/政策6大类风险。")
         return "\n".join(parts)
 
+    def _merge_llm_result(self, baseline: dict[str, Any], llm_result: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(baseline)
+
+        level = self._normalize_level(llm_result.get("overall_risk_level"))
+        if level:
+            merged["overall_risk_level"] = level
+
+        score = self._safe_float(llm_result.get("risk_score"))
+        if score is not None:
+            merged["risk_score"] = round(max(0.0, min(score, 10.0)), 2)
+
+        risks = self._normalize_risks(llm_result.get("risks"))
+        if risks:
+            merged["risks"] = risks
+
+        scenarios = self._normalize_scenarios(llm_result.get("scenarios"))
+        if scenarios:
+            merged["scenarios"] = scenarios
+
+        fatal_risks = self._normalize_text_list(llm_result.get("fatal_risks"), limit=4)
+        if fatal_risks:
+            merged["fatal_risks"] = fatal_risks
+
+        monitoring_points = self._normalize_text_list(llm_result.get("monitoring_points"), limit=5)
+        if monitoring_points:
+            merged["monitoring_points"] = monitoring_points
+
+        conclusion = str(llm_result.get("conclusion") or "").strip()
+        if conclusion:
+            merged["conclusion"] = conclusion
+
+        return merged
+
+    def _normalize_result(self, result: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(result)
+        normalized["risks"] = self._normalize_risks(normalized.get("risks")) or baseline.get("risks", [])
+        normalized["risk_score"] = self._safe_float(normalized.get("risk_score"))
+        if normalized["risk_score"] is None:
+            normalized["risk_score"] = baseline.get("risk_score", 5.0)
+        normalized["risk_score"] = round(max(0.0, min(float(normalized["risk_score"]), 10.0)), 2)
+        normalized["overall_risk_level"] = (
+            self._normalize_level(normalized.get("overall_risk_level"))
+            or self._risk_level_from_score(normalized["risk_score"])
+        )
+        normalized["scenarios"] = self._normalize_scenarios(normalized.get("scenarios")) or baseline.get("scenarios", [])
+        normalized["fatal_risks"] = (
+            self._normalize_text_list(normalized.get("fatal_risks"), limit=4) or baseline.get("fatal_risks", [])
+        )
+        normalized["monitoring_points"] = (
+            self._normalize_text_list(normalized.get("monitoring_points"), limit=5)
+            or baseline.get("monitoring_points", [])
+        )
+        if baseline.get("evidence_status") == "ok" and len(normalized["risks"]) < 4:
+            normalized["risks"] = baseline.get("risks", [])
+        if self._missing_risk_categories(normalized["risks"]) > 2:
+            normalized["risks"] = baseline.get("risks", [])
+        if len(normalized["scenarios"]) < 3:
+            normalized["scenarios"] = baseline.get("scenarios", [])
+        if len(normalized["monitoring_points"]) < 2:
+            normalized["monitoring_points"] = baseline.get("monitoring_points", [])
+        normalized["conclusion"] = str(normalized.get("conclusion") or baseline.get("conclusion") or "").strip()
+        normalized["evidence_status"] = baseline.get("evidence_status", "partial")
+        normalized["missing_fields"] = list(baseline.get("missing_fields", []) or [])
+        normalized["evidence_refs"] = list(baseline.get("evidence_refs", []) or [])
+        return normalized
+
+    @staticmethod
+    def _normalize_level(value: Any) -> str:
+        text = str(value or "").strip()
+        aliases = {"低风险": "低", "中风险": "中", "高风险": "高", "极高风险": "极高"}
+        text = aliases.get(text, text)
+        return text if text in {"低", "中", "高", "极高"} else ""
+
+    @staticmethod
+    def _normalize_risks(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        category_aliases = {
+            "行业风险": "行业",
+            "经营风险": "经营",
+            "财务风险": "财务",
+            "治理风险": "治理",
+            "市场风险": "市场",
+            "政策风险": "政策",
+        }
+        for item in value[:8]:
+            if not isinstance(item, dict):
+                continue
+            category = category_aliases.get(str(item.get("category") or "").strip(), str(item.get("category") or "").strip())
+            if category not in {"行业", "经营", "财务", "治理", "市场", "政策"}:
+                continue
+            severity = str(item.get("severity") or "中").strip()
+            probability = str(item.get("probability") or "中").strip()
+            if severity not in {"低", "中", "高"}:
+                severity = "中"
+            if probability not in {"低", "中", "高"}:
+                probability = "中"
+            risk_name = str(item.get("risk_name") or "").strip()
+            if not risk_name:
+                continue
+            normalized.append(
+                {
+                    "category": category,
+                    "risk_name": risk_name,
+                    "severity": severity,
+                    "probability": probability,
+                    "impact": str(item.get("impact") or "待验证").strip(),
+                    "mitigation": str(item.get("mitigation") or "持续跟踪并补充证据").strip(),
+                }
+            )
+        return normalized
+
+    def _normalize_scenarios(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        aliases = {"乐观情景": "乐观", "中性情景": "中性", "悲观情景": "悲观"}
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            scenario = aliases.get(str(item.get("scenario") or "").strip(), str(item.get("scenario") or "").strip())
+            if scenario not in {"乐观", "中性", "悲观"}:
+                continue
+            target_price = self._safe_float(item.get("target_price"))
+            upside_pct = self._safe_float(item.get("upside_pct"))
+            probability = self._safe_float(item.get("probability"))
+            assumptions = self._normalize_text_list(item.get("assumptions"), limit=4) or ["关键假设待验证"]
+            normalized.append(
+                {
+                    "scenario": scenario,
+                    "target_price": target_price,
+                    "upside_pct": upside_pct,
+                    "assumptions": assumptions,
+                    "probability": probability if probability is not None else {"乐观": 25.0, "中性": 50.0, "悲观": 25.0}[scenario],
+                }
+            )
+        order = {"乐观": 0, "中性": 1, "悲观": 2}
+        normalized.sort(key=lambda item: order.get(item["scenario"], 99))
+        return normalized
+
+    @staticmethod
+    def _normalize_text_list(value: Any, limit: int = 5) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if not text or text in result:
+                continue
+            result.append(text)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _missing_risk_categories(risks: list[dict[str, Any]]) -> int:
+        categories = {str(item.get("category") or "") for item in risks if isinstance(item, dict)}
+        required = {"行业", "经营", "财务", "治理", "市场", "政策"}
+        return len(required - categories)
+
     @staticmethod
     def _fmt(v: Any) -> str:
         """格式化数值"""
@@ -634,10 +893,7 @@ class RiskAgent(AgentBase[AgentInput, AgentOutput]):
         if v is None or v == "":
             return "N/A"
         try:
-            value = float(v)
-            if abs(value) <= 1.2:
-                value *= 100
-            return f"{value:.1f}%"
+            return f"{float(v):.1f}%"
         except (ValueError, TypeError):
             return str(v)
 
